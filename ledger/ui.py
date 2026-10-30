@@ -85,9 +85,9 @@ def e(s) -> str:
     return escape(str(s if s is not None else ""))
 
 
-def header(person: str) -> str:
+def header(person: str, title: str = "Zuha & Aneeq Ledger") -> str:
     return (f'<div class="lg-eyebrow">Household spending · signed in as {e(PEOPLE.get(person, person))}</div>'
-            f'<div class="lg-title">Zuha &amp; Aneeq Ledger</div>')
+            f'<div class="lg-title">{e(title)}</div>')
 
 
 def summary(L: Ledger, mo: str) -> str:
