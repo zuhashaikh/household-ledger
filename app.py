@@ -1,4 +1,4 @@
-"""Zuha & Aneeq Ledger — Streamlit app.
+"""Gherbaar - Zuha & Aneeq — Streamlit app.
 
 Run locally:  streamlit run app.py
 Secrets (see .streamlit/secrets.toml.example): [auth] Google sign-in, [people] who may sign in,
@@ -18,7 +18,7 @@ from ledger import ui
 from ledger.store import GoogleStore, LocalStore, now_iso
 
 # ---- The app's name. Change it here and it updates the page heading, sign-in screen and browser tab. ----
-APP_TITLE = "Zuha & Aneeq Ledger"
+APP_TITLE = "Gherbaar - Zuha & Aneeq"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
 
