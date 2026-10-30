@@ -1,4 +1,4 @@
-"""Gherbaar - Zuha & Aneeq — Streamlit app.
+"""Gherbaar
 
 Run locally:  streamlit run app.py
 Secrets (see .streamlit/secrets.toml.example): [auth] Google sign-in, [people] who may sign in,
