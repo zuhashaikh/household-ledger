@@ -17,7 +17,10 @@ from ledger.logic import (DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE,
 from ledger import ui
 from ledger.store import GoogleStore, LocalStore, now_iso
 
-st.set_page_config(page_title="Gherbaar - Zuha & Aneeq", page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
+# ---- The app's name. Change it here and it updates the page heading, sign-in screen and browser tab. ----
+APP_TITLE = "Zuha & Aneeq Ledger"
+
+st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
 
 # Who may sign in. [people] in the secrets overrides this.
 DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
@@ -50,11 +53,11 @@ def current_person() -> tuple[str, str]:
         if os.environ.get("LEDGER_LOCAL") == "1":
             st.sidebar.warning("Local test mode: no sign-in.")
             return "zuha", "local"
-        html('<div class="lg-title">Zuha &amp; Aneeq Ledger</div>')
+        html(f'<div class="lg-title">{ui.e(APP_TITLE)}</div>')
         st.error("Sign-in isn't set up yet, so the ledger stays locked. Add the [auth] and [auth.google] sections to this app's secrets.")
         st.stop()
     if not st.user.is_logged_in:
-        html('<div class="lg-title" style="margin-top:8vh">Zuha &amp; Aneeq Ledger</div><p class="lg-note" style="font-size:15px">Sign in with your Google account to see the household ledger.</p>')
+        html(f'<div class="lg-title" style="margin-top:8vh">{ui.e(APP_TITLE)}</div><p class="lg-note" style="font-size:15px">Sign in with your Google account to see the household ledger.</p>')
         st.button("Sign in with Google", type="primary", on_click=st.login, args=("google",))
         st.stop()
     email = str(st.user.get("email", "")).lower()
@@ -496,7 +499,7 @@ def main():
     months = L.months()
 
     top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
-    top_l.markdown(ui.header(person), unsafe_allow_html=True)
+    top_l.markdown(ui.header(person, APP_TITLE), unsafe_allow_html=True)
     m = top_r.selectbox("Month", list(reversed(months)), format_func=month_label, key="month") if months else None
     top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload",
                  on_click=lambda: st.session_state.update(page="Statements"))
