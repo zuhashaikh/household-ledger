@@ -1,4 +1,4 @@
-"""Gherbaar — Zuha & Aneeq.
+"""Zuha & Aneeq Ledger — Streamlit app.
 
 Run locally:  streamlit run app.py
 Secrets (see .streamlit/secrets.toml.example): [auth] Google sign-in, [people] who may sign in,
@@ -17,7 +17,7 @@ from ledger.logic import (DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE,
 from ledger import ui
 from ledger.store import GoogleStore, LocalStore, now_iso
 
-st.set_page_config(page_title="Gherbaar — Zuha & Aneeq", page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Zuha & Aneeq Ledger", page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
 
 # Who may sign in. [people] in the secrets overrides this.
 DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
@@ -310,7 +310,10 @@ def page_statements(L: Ledger, d: dict, person: str):
     html('<div class="lg-h2" style="margin-top:4px">Statements</div>')
     api_key = secret("anthropic").get("api_key")
     model = secret("anthropic").get("model", "claude-sonnet-5-5")
-    files = st.file_uploader("Add PDF statements", type=["pdf"], accept_multiple_files=True)
+    html('<p class="lg-note" style="margin:0 0 10px">Upload PDF statements from Chase, Wells Fargo or any other card. '
+         'Claude reads each one; you check the totals and pick whose account it is, then add it to the ledger. '
+         'The original PDF is saved to the shared Drive folder.</p>')
+    files = st.file_uploader("Bank or card statement PDFs", type=["pdf"], accept_multiple_files=True, key="uploader")
     if files and st.button("Read statements", type="primary", disabled=not api_key):
         from ledger.parse import read_statement
         pend = st.session_state.setdefault("pending", {})
@@ -495,6 +498,8 @@ def main():
     top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
     top_l.markdown(ui.header(person), unsafe_allow_html=True)
     m = top_r.selectbox("Month", list(reversed(months)), format_func=month_label, key="month") if months else None
+    top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload",
+                 on_click=lambda: st.session_state.update(page="Statements"))
     page = st.segmented_control("Page", PAGES, default="Overview", key="page", label_visibility="collapsed") or "Overview"
 
     with st.sidebar:
