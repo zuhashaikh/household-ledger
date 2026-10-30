@@ -17,7 +17,7 @@ from ledger.logic import (DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE,
 from ledger import ui
 from ledger.store import GoogleStore, LocalStore, now_iso
 
-st.set_page_config(page_title="Zuha & Aneeq Ledger", page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Gherbaar - Zuha & Aneeq", page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
 
 # Who may sign in. [people] in the secrets overrides this.
 DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
