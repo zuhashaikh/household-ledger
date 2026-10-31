@@ -180,11 +180,14 @@ def sections(L: Ledger, mo: str) -> str:
 
 
 def budget(L: Ledger, mo: str) -> str:
+    """Line by line: what the household spent against each line's budget, and which account it was paid from.
+    The line's owner is shown under its name; when the other person paid for it, that's called out."""
     rows = L.budget_rows(mo)
     out, last = [], None
     by_group: dict[str, list] = {}
     for r in rows:
         by_group.setdefault(r["section"], []).append(r)
+    bank = {"zuha": "Chase", "aneeq": "Wells Fargo", "shared": "Shared", "unset": "Not set"}
     for r in rows:
         g = r["section"]
         if g != last:
@@ -192,35 +195,47 @@ def budget(L: Ledger, mo: str) -> str:
             gs = sum(x["all"] for x in by_group[g])
             gb = sum(x["available"] for x in by_group[g])
             label = dict(SECTIONS).get(g, g)
-            out.append(f'<tr class="grp"><td colspan="8"><span class="lg-eyebrow">{e(label)}</span> <span class="lg-muted num" style="font-size:13px;margin-left:8px">{m(gs)} spent{(" of " + m(gb)) if gb else ""}</span></td></tr>')
+            out.append(f'<tr class="grp"><td colspan="5"><span class="lg-eyebrow">{e(label)}</span> <span class="lg-muted num" style="font-size:13px;margin-left:8px">{m(gs)} spent{(" of " + m(gb)) if gb else ""}</span></td></tr>')
         b = r["available"]
+        paid = r["paid"]
         scale = max(b, r["all"], 1)
         x, segs = 0.0, ""
-        for k in ("zuha", "aneeq", "shared", "none"):
-            w = max(0.0, r[k]) / scale * 100
-            segs += f'<span class="s-{k}" style="left:{x:.2f}%;width:{w:.2f}%"></span>'
+        for k in ("zuha", "aneeq", "shared", "unset"):
+            w = max(0.0, paid.get(k, 0)) / scale * 100
+            segs += f'<span class="s-{"none" if k == "unset" else k}" style="left:{x:.2f}%;width:{w:.2f}%"></span>'
             x += w
         if b and r["all"] > b:
             segs += f'<span style="left:{b/scale*100:.2f}%;width:2px;background:var(--ink)"></span>'
         owner = r["owner"]
-        own = f'<span class="why"><span class="dot d-{owner}"></span>{"Split 50:50" if owner == "shared" else PEOPLE[owner] + "&#39;s"}</span>' if owner else ""
-        aside = f'<span class="aside">−{m(r["set_aside"])} for {e(r["set_aside_for"].rsplit(" ", 1)[0])}</span>' if r["set_aside"] else ""
-        if not b and r["set_aside"] and not r["all"]:
-            st = '<span class="pill nobud">All set aside</span>'
-        elif not b and not r["set_aside"]:
-            st = '<span class="pill nobud">No budget</span>' if r["all"] < .5 else '<span class="pill over">no budget</span>'
+        own = (f'<span class="why"><span class="dot d-{owner}"></span>{"Shared 50:50" if owner == "shared" else PEOPLE[owner] + "&#39;s line"}</span>'
+               if owner else '<span class="why">no owner yet</span>')
+        payers = " ".join(f'<span class="num" style="white-space:nowrap;margin-right:8px"><span class="dot d-{"none" if k == "unset" else k}"></span>{bank[k]} {m(paid[k])}</span>'
+                          for k in ("zuha", "aneeq", "shared", "unset") if abs(paid.get(k, 0)) >= .5)
+        cross = ""
+        if owner in ("zuha", "aneeq"):
+            other = "aneeq" if owner == "zuha" else "zuha"
+            amt = paid.get(other, 0) + paid.get("shared", 0) / 2
+            if amt >= .5:
+                cross = (f'<span class="why" style="color:var(--{other})"><b>{PEOPLE[other]} paid {m(amt)}</b> of {PEOPLE[owner]}&#39;s line</span>')
+        if not b and not r["all"]:
+            st = '<span class="pill nobud">No budget</span>'
+        elif not b:
+            st = '<span class="pill over">no budget</span>'
         else:
             st = _state(r["all"], b)
-        cell = lambda k: f'<td class="r num" style="color:var(--{k})">{m(r[k]) if abs(r[k]) >= .5 else "–"}</td>'
-        out.append(f'<tr><td><b>{e(r["cat"])}</b>{own}</td><td class="r num">{m(r["planned"]) if r["planned"] else "–"}{aside}</td>'
-                   f'<td class="r num">{m(r["all"])}</td><td style="width:24%"><div class="bar {"over" if b and r["all"] > b else ""}">{segs}</div></td>'
-                   f'{cell("zuha")}{cell("aneeq")}{cell("shared")}<td>{st}</td></tr>')
-    legend = ('<div class="lg-legend"><span><span class="dot d-zuha"></span>Zuha</span><span><span class="dot d-aneeq"></span>Aneeq</span>'
-              '<span><span class="dot d-shared"></span>Shared</span><span><span class="dot d-none"></span>Not assigned</span></div>')
+        out.append(f'<tr><td><b>{e(r["cat"])}</b>{own}</td><td class="r num">{m(r["planned"]) if r["planned"] else "–"}</td>'
+                   f'<td class="r num"><b>{m(r["all"])}</b></td>'
+                   + (f'<td style="min-width:220px"><div class="bar {"over" if b and r["all"] > b else ""}">{segs}</div>'
+                      f'<div style="margin-top:4px;font-size:13px">{payers}</div>{cross}</td>' if payers else '<td></td>')
+                   + f'<td>{st}</td></tr>')
+    legend = ('<div class="lg-legend"><span>Paid from:</span><span><span class="dot d-zuha"></span>Zuha (Chase)</span>'
+              '<span><span class="dot d-aneeq"></span>Aneeq (Wells Fargo)</span><span><span class="dot d-none"></span>Account not set</span></div>')
     return (f'<div class="lg-h2">Budget vs. spent by line, {e(month_label(mo))}</div>{legend}'
-            '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>Line</th><th class="r">Budget</th><th class="r">Spent</th><th>Split</th>'
-            '<th class="r">Zuha</th><th class="r">Aneeq</th><th class="r">Shared</th><th>Status</th></tr></thead>'
-            f'<tbody>{"".join(out) or "<tr><td colspan=8 class=lg-muted>No budget or spending this month.</td></tr>"}</tbody></table></div>')
+            '<p class="lg-note" style="margin:0 0 8px">Spent is what the household spent on the line. The bar shows which account paid. '
+            'Under each line: whose line it is, and when the other person paid for it (Settle up trues that up).</p>'
+            '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>Line</th><th class="r">Budget</th><th class="r">Spent</th>'
+            '<th>Paid from</th><th>Status</th></tr></thead>'
+            f'<tbody>{"".join(out) or "<tr><td colspan=5 class=lg-muted>No budget or spending this month.</td></tr>"}</tbody></table></div>')
 
 
 def big_card(L: Ledger, p: dict) -> str:
