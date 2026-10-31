@@ -251,13 +251,27 @@ class Ledger:
         return t.get("payer") or self.rules["payer"].get(t.get("account") or "") or None
 
     def contrib_of(self, t: dict) -> dict | None:
-        if not t.get("spend"):
+        """Money one of you sent the other, counted once and only on Zuha's side:
+        from Aneeq = money coming INTO one of Zuha's accounts; from Zuha = money going OUT of one of her accounts.
+        The same transfer on Aneeq's own account is ignored, so it's never counted twice, and a description
+        match in the wrong direction (e.g. a payment that merely mentions Wells Fargo) doesn't count."""
+        if not t.get("spend") or t.get("not_between"):
+            return None
+        if self.payer_of(t) == "aneeq":
             return None
         d = str(t.get("desc") or "").lower()
         for r in self.rules.get("contrib") or []:
-            if r and r.get("match") and str(r["match"]).lower() in d:
+            if not (r and r.get("match") and str(r["match"]).lower() in d):
+                continue
+            if r.get("from") == "aneeq" and t["spend"] < 0:
+                return r
+            if r.get("from") == "zuha" and t["spend"] > 0:
                 return r
         return None
+
+    def transfers(self, m: str) -> list[dict]:
+        """Every transaction counted as money between you in month m."""
+        return [{**t, "dir": self.contrib_of(t)["from"]} for t in self.month_txns(m, with_deductions=False) if self.contrib_of(t)]
 
     # ---------- big expenses ----------
     def proj_by_id(self, pid: str | None) -> dict | None:

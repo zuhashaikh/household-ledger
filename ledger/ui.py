@@ -291,13 +291,22 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
         end = '<b class="good-t">All paid</b>'
     sent = f'He sent {m(r["he_sent"], True)}' + (f' and had {m(-r["start"], True)} credit from earlier' if r["start"] <= -1 else "")
     ab = f' {m(r["absorbed"], True)} of his own extra spending was absorbed.' if r["absorbed"] >= 1 else ""
+    tx = L.transfers(r["month"])
+    DIR_LABEL = {"aneeq": '<span class="dot d-aneeq"></span>Aneeq to Zuha', "zuha": '<span class="dot d-zuha"></span>Zuha to Aneeq'}
+    tx_rows = "".join(f'<tr><td class="num lg-muted" style="white-space:nowrap">{e(t["date"])}</td><td><b>{e(t["desc"])}</b><span class="why">{e(t.get("account", ""))}</span></td>'
+                      f'<td>{DIR_LABEL[t["dir"]]}</td>'
+                      f'<td class="r num">{m(abs(t["spend"]), True)}</td></tr>' for t in sorted(tx, key=lambda t: t["date"]))
+    tx_html = (f'<div class="lg-eyebrow" style="margin:14px 0 6px">Money counted between you in {e(month_label(r["month"]))}</div>'
+               f'<div class="lg-scroll"><table class="lg-table"><tbody>{tx_rows}</tbody></table></div>'
+               '<p class="lg-note">If something here isn&#39;t really money between you, open it on Transactions (filter: Money between you) '
+               'and tick <b>Not between us</b>.</p>') if tx_rows else ""
     return (f'<div class="lg-h2">Where Aneeq&#39;s money went, {e(month_label(r["month"]))}</div>'
             f'<p class="lg-note" style="margin:0 0 8px">{sent}. It pays, in order: anything owed from earlier months, Core, Extras I, '
             f'Extras II and big expenses, other, then money Zuha sent him. Whatever is left is credit for next month.{ab}</p>'
             '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>In order</th><th class="r">He owed</th>'
             '<th class="r">Covered by his own spending</th><th class="r">Paid from money he sent</th><th class="r">Still owed</th></tr></thead>'
             f'<tbody>{"".join(trs) or "<tr><td colspan=5 class=lg-muted>Nothing owed this month.</td></tr>"}'
-            f'<tr class="tot"><td colspan="5">{end}</td></tr></tbody></table></div>')
+            f'<tr class="tot"><td colspan="5">{end}</td></tr></tbody></table></div>' + tx_html)
 
 
 def person_budget(L: Ledger, mo: str, who: str) -> str:
