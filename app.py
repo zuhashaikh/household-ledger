@@ -202,20 +202,24 @@ def page_overview(L: Ledger, m: str):
 
 
 def page_budget(L: Ledger, m: str, person: str = "zuha"):
-    html(ui.budget(L, m).replace('<div class="lg-h2">', '<div class="lg-h2" style="margin-top:4px">', 1))
-    html(f'<div class="lg-h2">Budget check by person, {ui.e(month_label(m))}</div>')
-    names = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}
-    who_label = st.segmented_control("Person", list(names.values()), default=names.get(person, names["zuha"]),
-                                     key="budget-person", label_visibility="collapsed") or names.get(person, names["zuha"])
-    who = next(k for k, v in names.items() if v == who_label)
-    html(ui.person_budget(L, m, who))
+    t_line, t_person, t_edit = st.tabs(["By line", "By person", "Edit or add lines"])
+    with t_line:
+        html(ui.budget(L, m).replace('<div class="lg-h2">', '<div class="lg-h2" style="margin-top:4px">', 1))
+    with t_person:
+        html(f'<div class="lg-h2" style="margin-top:4px">Budget check by person, {ui.e(month_label(m))}</div>')
+        names = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}
+        who_label = st.segmented_control("Person", list(names.values()), default=names.get(person, names["zuha"]),
+                                         key="budget-person", label_visibility="collapsed") or names.get(person, names["zuha"])
+        who = next(k for k, v in names.items() if v == who_label)
+        html(ui.person_budget(L, m, who))
     own = m in L.plan["byMonth"]
     rows = L.budget_rows(m)
     SEC_LABEL = {k: l for k, l in SECTIONS}
     SEC_KEY = {l: k for k, l in SECTIONS}
     NOT_ON = "Not in the budget"
 
-    exp = st.expander("Edit budget lines: amount, section, whose")
+    exp = t_edit
+    exp.markdown("**Edit budget lines: amount, section, whose**")
     exp.caption((f"{month_label(m)} has its own plan from your budget sheet; amount changes apply to this month only."
                  if own else f"This month uses your standard plan; amount changes apply from {month_label(m)} on. Earlier months keep their budgets.")
                 + " Section and whose apply to every month. Set an amount to 0 to take a line off this month's budget.")
@@ -257,7 +261,7 @@ def page_budget(L: Ledger, m: str, person: str = "zuha"):
             st.session_state["bud-flash"] = "Budget saved."
             st.rerun()
 
-    with st.expander("＋ Add a budget line"):
+    with t_edit, st.expander("＋ Add a budget line"):
         with st.form("add-line", clear_on_submit=True):
             c1, c2 = st.columns(2)
             name = c1.text_input("Name", placeholder="e.g. Gym, Car maintenance, Gifts")
