@@ -383,6 +383,9 @@ def page_transactions(L: Ledger, m: str, person: str):
             status = "Line remembered · " + why
         else:
             status = why
+        spread = L.months_paid_for(t)
+        if spread:
+            status += " · pays for " + ", ".join(f"{month_label(mo).split()[0]} {ui.m(a)}" for mo, a in spread)
         orig = L.refund_matches().get(t["id"]) if t["spend"] < 0 else None
         if orig:
             status = f"Refund of the {orig['date']} charge · counts in {month_label(L.month_of(orig))} · " + status
