@@ -195,6 +195,8 @@ def page_transactions(L: Ledger, m: str, person: str):
             status = "Line remembered · " + why
         else:
             status = why
+        if L.shifted(t):
+            status = f"Counts in {month_label(L.month_of(t))} (billed for next month) · " + status
         keep = {"Needs a person": not (who or ex or cb or pj), "All": True, "Big expenses": bool(pj and not cb),
                 "Money between you": bool(cb), "Not counted": ex}[show]
         if not keep or (q and q not in f"{t['desc']} {c} {t.get('account','')}".lower()):
@@ -655,6 +657,13 @@ def page_rules(L: Ledger, d: dict):
                                          "Line": st.column_config.SelectboxColumn(options=[""] + L.all_categories()),
                                          "Who": st.column_config.SelectboxColumn(options=WHO_OPTS)})
 
+    st.markdown("**Billed for next month** (charges from these merchants on or after the given day count in the following month)")
+    sdf = pd.DataFrame([{"Merchant contains": x["match"], "From day": int(x.get("from_day") or 20)} for x in L.shift_rules()],
+                       columns=["Merchant contains", "From day"])
+    shed = st.data_editor(sdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-shift",
+                          column_config={"Merchant contains": st.column_config.TextColumn(help="Lowercase words from the merchant name, e.g. ota scuba swim"),
+                                         "From day": st.column_config.NumberColumn(min_value=1, max_value=31, step=1)})
+
     st.markdown("**Taken from pay** (counted as spent every month without a statement, e.g. insurance deducted from a paycheck)")
     ddf = pd.DataFrame([{"Line": x["line"], "Whose pay": PEOPLE.get(x.get("who") or "zuha"), "Amount": float(x["amount"]) if x.get("amount") else None}
                         for x in L.deductions()], columns=["Line", "Whose pay", "Amount"])
@@ -705,6 +714,8 @@ def page_rules(L: Ledger, d: dict):
         r["deductions"] = [{"line": x["Line"], "who": WHO_KEY.get(x["Whose pay"] or "Zuha") or "zuha",
                             **({"amount": float(x["Amount"])} if x["Amount"] == x["Amount"] and x["Amount"] else {})}
                            for _, x in ded.iterrows() if x["Line"]]
+        r["shift"] = [{"match": str(x["Merchant contains"]).strip().lower(), "from_day": int(x["From day"] or 20)}
+                      for _, x in shed.iterrows() if str(x["Merchant contains"] or "").strip() and x["From day"] == x["From day"]]
         r["learn"] = {}
         for _, x in lred.iterrows():
             k = str(x["Merchant"] or "").strip().lower()
