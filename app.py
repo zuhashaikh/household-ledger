@@ -9,13 +9,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import uuid
 
 import pandas as pd
 import streamlit as st
 
-from ledger.logic import (learn_key, DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE, SECTIONS, Ledger, month_label)
-from ledger import ui
+from ledger.logic import (learn_key, merchant_key, DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE, SECTIONS, Ledger, month_label)
+from ledger import bankfeed, ui
 from ledger.store import GoogleStore, LocalStore, now_iso
 
 # ---- The app's name. Change it here and it updates the page heading, sign-in screen and browser tab. ----
@@ -409,8 +410,116 @@ def page_settle(L: Ledger):
     html(ui.settle(L))
 
 
+# ---------------------------------------------------------------- bank sync (SimpleFIN)
+def feed_urls() -> list[str]:
+    sec = secret("simplefin")
+    urls = sec.get("access_urls") or ([sec["access_url"]] if sec.get("access_url") else [])
+    return [str(u) for u in urls if u]
+
+
+def run_sync(person: str) -> tuple[str, list[str]]:
+    """Pull recent transactions from every connected bank and add the ones not already in the ledger."""
+    store = get_store()
+    d, LL = fresh()
+    sync = d["config"].get("sync") or {}
+    start, end = bankfeed.window(sync.get("last"), time.time())
+    rows, errs = [], []
+    for u in feed_urls():
+        try:
+            data = bankfeed.fetch(u, start, end)
+        except bankfeed.FeedError as e:
+            errs.append(str(e))
+            continue
+        except Exception as e:  # noqa: BLE001 — network trouble: report it, keep going
+            errs.append(f"Couldn't reach SimpleFIN ({type(e).__name__}). Try again later.")
+            continue
+        errs += bankfeed.messages(data)
+        rows += bankfeed.to_rows(data, LL.accounts())
+    new, dup = LL.add_parsed(rows, "bank-sync", person)
+    # Charges you categorized by hand before (one at a time) keep that line when they come in from the bank.
+    prior: dict[str, str] = {}
+    for t in sorted(LL.txns, key=lambda t: t["date"]):
+        if t.get("cat_override"):
+            prior[learn_key(t["desc"])] = t["cat_override"]
+    for t in new:
+        k = learn_key(t["desc"])
+        if k in prior and not LL.learned(t).get("line"):
+            t["cat_override"] = prior[k]
+    # Categorize only what the household's own rules don't already cover.
+    unknown = [t for t in new if t["category"] == "Uncategorized" and LL.cat_of(t) == "Uncategorized" and not LL.contrib_of(t)]
+    key, model = secret("anthropic").get("api_key"), secret("anthropic").get("model", "claude-sonnet-5-5")
+    if unknown and key:
+        try:
+            from ledger.parse import categorize
+            done = categorize([{"desc": t["desc"], "amt": t["spend"], "account": t["account"], "category": t["category"]} for t in unknown],
+                              LL, key, model)
+            for t, r in zip(unknown, done):
+                t["category"] = r["category"]
+        except Exception:  # noqa: BLE001 — leave them for the Not in budget tab
+            errs.append("Claude couldn't categorize some new charges; they're on the Not in budget tab.")
+    # New accounts: Chase is Zuha's, Wells Fargo is Aneeq's.
+    rules, changed = LL.rules, False
+    for a in {t["account"] for t in new}:
+        if not rules["payer"].get(a):
+            who = "zuha" if "chase" in a.lower() else "aneeq" if "wells" in a.lower() else None
+            if who:
+                rules["payer"][a] = who
+                changed = True
+    if new:
+        store.save_txns(d["txns"] + new)
+    if changed:
+        store.save_config("rules", rules)
+    store.save_config("sync", {"last": end, "at": now_iso(), "by": person, "added": len(new), "skipped": dup, "errors": errs[:10]})
+    bump()
+    msg = f"Bank sync added {len(new)} new transaction{'s' if len(new) != 1 else ''}" + (f" ({dup} already in the ledger)" if dup else "") + "."
+    return msg, errs
+
+
+def bank_sync_panel(d: dict, person: str):
+    urls = feed_urls()
+    sync = d["config"].get("sync") or {}
+    html('<div class="lg-h2" style="margin-top:4px">Bank sync</div>')
+    if urls:
+        last = sync.get("at")
+        info = (f"Last synced {str(last)[:16].replace('T', ' ')} by {PEOPLE.get(sync.get('by'), sync.get('by', ''))}: "
+                f"{sync.get('added', 0)} new, {sync.get('skipped', 0)} already here." if last else "Not synced yet.")
+        html(f'<p class="lg-note" style="margin:0 0 8px">{ui.e(info)} The app also syncs by itself when someone opens it '
+             'and the last sync is more than 20 hours old. Banks update once a day.</p>')
+        for e_ in sync.get("errors") or []:
+            st.warning(e_)
+        recent = sync.get("last") and time.time() - float(sync["last"]) < 15 * 60
+        if st.button("Sync banks now", type="primary", key="sync-now", disabled=bool(recent),
+                     help="Available again 15 minutes after the last sync" if recent else None):
+            with st.spinner("Getting new transactions from your banks…"):
+                msg, errs = run_sync(person)
+            st.session_state["st-flash"] = msg
+            st.rerun()
+    else:
+        html('<p class="lg-note" style="margin:0 0 8px">Connect Chase and Wells Fargo through SimpleFIN Bridge so new '
+             'transactions come in automatically. PDF uploads below keep working either way.</p>')
+    with st.expander("Connect banks" if not urls else "Connect another SimpleFIN account"):
+        st.markdown("1. In SimpleFIN Bridge, link your banks, then under **Apps** create a new connection and copy the **setup token**.\n"
+                    "2. Paste it here and press **Connect**. Each token works once.")
+        tok = st.text_input("Setup token", type="password", key="sfin-token")
+        if st.button("Connect", key="sfin-connect") and tok.strip():
+            try:
+                access = bankfeed.claim(tok)
+            except bankfeed.FeedError as e:
+                st.error(str(e))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Couldn't reach SimpleFIN ({type(e).__name__}). Try again.")
+            else:
+                all_urls = urls + [access]
+                block = ("[simplefin]\n" + (f'access_url = "{access}"' if len(all_urls) == 1
+                                             else "access_urls = [\n" + ",\n".join(f'  "{u}"' for u in all_urls) + "\n]"))
+                st.success("Connected. Last step: save this in the app's secrets (⋮ → Settings → Secrets), "
+                           "replacing any existing [simplefin] section, then reboot the app. Keep it private: it reads your bank transactions.")
+                st.code(block, language="toml")
+
+
 def page_statements(L: Ledger, d: dict, person: str):
-    html('<div class="lg-h2" style="margin-top:4px">Statements</div>')
+    bank_sync_panel(d, person)
+    html('<div class="lg-h2">Statements</div>')
     api_key = secret("anthropic").get("api_key")
     model = secret("anthropic").get("model", "claude-sonnet-5-5")
     html('<p class="lg-note" style="margin:0 0 10px">Upload PDF statements from Chase, Wells Fargo or any other card. '
@@ -650,6 +759,17 @@ def main():
     person, email = current_person()
     store = get_store()
     d = load_data(store, st.session_state.get("v", 0))
+    if feed_urls() and not st.session_state.get("autosync-done"):
+        st.session_state["autosync-done"] = True
+        last = float((d["config"].get("sync") or {}).get("last") or 0)
+        if time.time() - last > 20 * 3600:
+            with st.spinner("Checking your banks for new transactions…"):
+                try:
+                    msg, _ = run_sync(person)
+                    st.toast(msg)
+                except Exception:  # noqa: BLE001 — never block the app on the feed
+                    pass
+            d = load_data(store, st.session_state.get("v", 0))
     L = ledger_from(d)
     months = L.months()
 
