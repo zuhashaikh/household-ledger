@@ -196,10 +196,11 @@ def close_month_toggle(L: Ledger, m: str, key: str):
 
 def page_overview(L: Ledger, m: str):
     html(ui.summary(L, m))
-    html(ui.sections(L, m))
-    html('<div class="lg-h2">Extras II fund</div>')
-    html(ui.fund_panel(L, m, compact=True))
+    html(f'<div class="lg-h2">Are we on budget? {ui.e(month_label(m))}</div>')
+    html(ui.budget_cards(L, m))
     close_month_toggle(L, m, f"close-ov-{m}")
+    with st.expander("Detail: by section and account"):
+        html(ui.sections(L, m))
 
 
 def page_budget(L: Ledger, m: str, person: str = "zuha"):
