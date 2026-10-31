@@ -193,8 +193,53 @@ class Ledger:
                             "payer": who, "person": who if x.get("counts_toward") == "self" else None, "mk": ""})
         return out
 
-    def month_txns(self, m: str, with_deductions: bool = True) -> list[dict]:
+    def split_rules(self) -> list[dict]:
+        """Charges that pay for more than one line. Default: Blackbend pays both girls' schools."""
+        r = self.rules.get("split")
+        if r is None:
+            r = [{"match": r"black\s*bend", "lines": ["Khadeeja", "Haniya's School"], "label": "Blackbend school payments"}]
+        return [x for x in r if x and x.get("match") and x.get("lines")]
+
+    def split_parts(self, t: dict) -> list[dict] | None:
+        """If a split rule applies, the charge's parts, one per line. A charge equal to one line's budget (within $5)
+        goes to that line alone; otherwise it's divided in proportion to the lines' budgets that month.
+        A line chosen by hand for the charge, or remembered for the merchant, wins over the split."""
+        if t.get("synthetic") or t.get("cat_override") or t.get("project") or self.learned(t).get("line") or self.learned(t).get("project"):
+            return None
+        d = str(t.get("desc") or "").lower()
+        for x in self.split_rules():
+            try:
+                if not re.search(x["match"], d):
+                    continue
+            except re.error:
+                continue
+            have = set(self.budget_lines())
+            lines = [l for l in x["lines"] if l in have]
+            if not lines:
+                return None
+            plan = self.plan_for(self.month_of(t))
+            bud = {l: float(plan.get(l) or 0) for l in lines}
+            amt = float(t["spend"])
+            exact = [l for l in lines if bud[l] and abs(abs(amt) - bud[l]) <= 5]
+            if len(lines) == 1 or len(exact) == 1:
+                shares = {(exact or lines)[0]: 1.0}
+            else:
+                tot = sum(bud.values())
+                shares = {l: (bud[l] / tot if tot else 1 / len(lines)) for l in lines}
+            parts, left = [], amt
+            items = list(shares.items())
+            for i, (l, f) in enumerate(items):
+                a = round(amt * f, 2) if i < len(items) - 1 else round(left, 2)
+                left -= a
+                parts.append({**t, "id": f"{t['id']}#{i}", "split_of": t["id"], "cat_override": l, "spend": a,
+                              "split_note": x.get("label") or "split"})
+            return parts
+        return None
+
+    def month_txns(self, m: str, with_deductions: bool = True, split: bool = True) -> list[dict]:
         own = [t for t in self.txns if self.month_of(t) == m]
+        if split:
+            own = [p for t in own for p in (self.split_parts(t) or [t])]
         return own + (self.deduction_txns(m) if with_deductions and own else [])
 
     def plan_for(self, m: str) -> dict:
@@ -230,9 +275,6 @@ class Ledger:
                     return r["cat"]
             except re.error:
                 continue
-        # Built-in: Blackbend payments are Haniya's school (only if that line exists; a remembered line still wins).
-        if re.search(r"black\s*bend", d) and "Haniya's School" in self.budget_lines():
-            return "Haniya's School"
         return None
 
     def learned(self, t: dict) -> dict:
@@ -728,3 +770,49 @@ class Ledger:
             new.append(t)
             used.add(tid)
         return new, dup
+
+
+def rename_line(plan: dict, rules: dict, projects: list[dict], txns: list[dict], old: str, new: str) -> dict[str, dict]:
+    """Rename a budget line everywhere it's used: budgets (standard and per month), section, owner, store and merchant
+    rules, remembered choices, split rules, pay deductions, big-expense funding, and charges put on it by hand.
+    Changes plan/rules/projects in place and returns the changes to make to transactions (id -> fields)."""
+    def swap(d: dict):
+        if old in d:
+            d[new] = d.pop(old)
+    swap(plan["budgets"])
+    for v in plan["byMonth"].values():
+        swap(v)
+    swap(plan["groups"])
+    for k in ("category", "exclude"):
+        swap(rules.setdefault(k, {}))
+    for k in ("catmap", "recat"):
+        for kk, v in list((rules.get(k) or {}).items()):
+            if v == old:
+                rules[k][kk] = new
+    for v in (rules.get("learn") or {}).values():
+        if v.get("line") == old:
+            v["line"] = new
+    for r in rules.get("patcat") or []:
+        if r.get("cat") == old:
+            r["cat"] = new
+    for r in rules.get("deductions") or []:
+        if r.get("line") == old:
+            r["line"] = new
+    sp = rules.get("split")
+    if sp is None:  # write out the built-in split so the rename sticks
+        sp = rules["split"] = Ledger(rules=rules, plan=plan, projects=projects, txns=[]).split_rules()
+    for r in sp:
+        r["lines"] = [new if l == old else l for l in r.get("lines") or []]
+    for p in projects:
+        for f in p.get("funding") or []:
+            if f.get("line") == old:
+                f["line"] = new
+    changes: dict[str, dict] = {}
+    for t in txns:
+        ch = {k: new for k in ("cat_override", "for_line") if t.get(k) == old}
+        if t.get("category") == old:
+            ch["category"] = new
+        if ch:
+            changes[t["id"]] = ch
+    return changes
+
