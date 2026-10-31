@@ -1,818 +1,1095 @@
-"""Ledger rules and math. Pure functions over plain dicts, ported from the Zuha & Aneeq Ledger page.
+"""Zuha & Aneeq Ledger — Streamlit app.
 
-Transaction dict fields (snake_case):
-  id, month, date (YYYY-MM-DD), desc, spend (+ money out, - money in), category (as imported),
-  account, mk (merchant key), cat_override, person, project, proj_item, for_line, moved_from,
-  statement_id, added_by
+Run locally:  streamlit run app.py
+Secrets (see .streamlit/secrets.toml.example): [auth] Google sign-in, [people] who may sign in,
+[google] where the sheet and statements live, [anthropic] for reading PDFs.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
-from dataclasses import dataclass, field
+import time
+import uuid
 
-PEOPLE = {"zuha": "Zuha", "aneeq": "Aneeq", "shared": "Shared"}
-PAYER_LABEL = {"zuha": "Zuha (Chase + pay)", "aneeq": "Aneeq (Wells Fargo)", "shared": "Joint", "unset": "Payer not set"}
-SECTIONS = [("Home Budget", "Core budget"), ("Extras I", "Extras I"), ("Extras II (Split 50:50)", "Extras II")]
-DEFAULT_SECTION = "Extras II (Split 50:50)"
-# Paying off a card: the card's own charges are already counted, so the payment (on the checking side) and the
-# payment received (on the card side) are never spending.
-CARD_PAYMENT = re.compile(r"payment\s*-?\s*thank\s*you|thank\s*you\s*-?\s*payment|automatic payment|"
-                          r"(credit\s*c(ar)?d|crd|card)\s*(auto\s*pay|autopay|e?-?payment|e?pay|pmt)|"
-                          r"payment to (chase|wells fargo|wf|amex|citi|discover|capital one)|"
-                          r"(chase|wells\s*fargo|wf)\s*(credit\s*)?card\s*(auto\s*pay|autopay|payment|pmt|epay)|"
-                          r"payment received|amex epayment|discover e-payment|applecard gsbank", re.I)
-# Moving money between your own accounts.
-OWN_TRANSFER = re.compile(r"\bonline transfer\b|\btransfer (to|from) (sav|chk|check|acct|account|my|share|\S*x{2,}|\S*\d{4})|"
-                          r"\bxfer\b|moneyline", re.I)
-# Money between Zuha and Aneeq, as it appears on each side. It is counted once, on Zuha's accounts.
-SPOUSE_NAME = {"zuha": re.compile(r"zuha|shaikh", re.I), "aneeq": re.compile(r"aneeq|cheema", re.I)}
-MONEY_MOVE = re.compile(r"zelle|transfer|xfer|venmo|cash app|paypal\s*\*?\s*(transfer|inst xfer)", re.I)
-DEFAULT_EXCLUDE = re.compile(r"transfer|credit card payment|payment|paycheck|income|deposit|refund reversal", re.I)
+import pandas as pd
+import streamlit as st
 
+from ledger.logic import (rename_line, learn_key, merchant_key, DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE, SECTIONS, Ledger, month_label)
+from ledger import bankfeed, ui
+from ledger.store import GoogleStore, LocalStore, now_iso
 
-def empty_rules() -> dict:
-    return {"merchant": {}, "account": {}, "category": {}, "recat": {}, "exclude": {}, "catmap": {},
-            "payer": {}, "contrib": [], "accounts": [], "patcat": []}
+# ---- The app's name. Change it here and it updates the page heading, sign-in screen and browser tab. ----
+APP_TITLE = "Zuha & Aneeq Ledger"
 
+st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
 
-def norm_rules(r: dict | None) -> dict:
-    out = empty_rules()
-    out.update(r or {})
-    return out
+# Who may sign in. [people] in the secrets overrides this.
+DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
+
+PAGES = ["Overview", "Budget", "Transactions", "Not in budget", "Big expenses", "Settle up", "Statements", "Rules"]
+# The three colours used everywhere: purple = Zuha, blue = Aneeq, gold = Shared.
+WHO_NAME = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq", "shared": "🟡 Shared"}
+WHO_OPTS = [""] + list(WHO_NAME.values())
+WHO_KEY = {"": None, "Zuha": "zuha", "Aneeq": "aneeq", "Shared": "shared", **{v: k for k, v in WHO_NAME.items()}}
+PAID_NAME = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq", "shared": "🟡 Joint"}
+UNSET, NO_ITEM, NO_LINE = "⚪ Not set", "—", "—"
+PAYER_OPTS = {"": None, "Zuha (Chase)": "zuha", "Aneeq (Wells Fargo)": "aneeq", "Joint": "shared"}
 
 
-def merchant_key(desc: str) -> str:
-    d = str(desc or "").lower()
-    k = d.split("*")[0]
-    k = re.sub(r"#\s*\d+", "", k)
-    k = re.sub(r"\d{3,}", "", k)
-    k = re.sub(r"[^a-z&' ]+", " ", k)
-    k = re.sub(r"\s+", " ", k).strip()
-    k = " ".join(k.split(" ")[:3])
-    return k or d.strip()
+def money(x: float, cents: bool = False) -> str:
+    s = f"${abs(x):,.2f}" if cents else f"${abs(x):,.0f}"
+    return ("−" if x < -0.004 else "") + s
 
 
-_PREFIXES = re.compile(r"^(card purchase with pin|card purchase|debit card purchase|purchase authorized on|pos purchase|pos|recurring payment|ach debit|online transfer to|online payment to|web pymt|sq|tst|sp|py|dd)\b\s*")
+def secret(section: str) -> dict:
+    """A secrets section as a dict, or {} when it (or the whole secrets file) is missing."""
+    try:
+        return dict(st.secrets[section]) if section in st.secrets else {}
+    except Exception:  # noqa: BLE001 — no secrets file at all
+        return {}
 
 
-def learn_key(desc: str) -> str:
-    """Merchant identity for remembered choices: the merchant's name without store numbers, card prefixes
-    or reference codes. Keeps the person in Zelle descriptions, so each payee is remembered separately."""
-    d = str(desc or "").lower()
-    if "*" in d:
-        head, tail = d.split("*", 1)
-        # Payment processors put the real merchant after the "*" (PAYPAL *EBAY, SQ *CAFE, TST* GRILL).
-        processor = head.strip() in {"paypal", "pp", "sq", "tst", "sp", "py", "dd", "ppl", "gglpay", "google", "apl", "venmo"}
-        d = tail if processor or len(head.strip()) < 4 else head
-    d = re.sub(r"[^a-z0-9&' ]+", " ", d)
-    d = _PREFIXES.sub("", d.strip())
-    words = [w for w in d.split() if not re.search(r"\d", w) and len(w) > 1 and w not in {"tx", "ca", "wa", "ny", "nj", "nc", "com", "bill"}]
-    return " ".join(words[:5]) or d.strip()
+# ---------------------------------------------------------------- sign-in
+def current_person() -> tuple[str, str]:
+    people = {str(v).strip().lower(): k for k, v in (secret("people") or DEFAULT_PEOPLE).items()}
+    if not secret("auth"):
+        # Open access only for testing on your own computer: LEDGER_LOCAL=1 streamlit run app.py
+        if os.environ.get("LEDGER_LOCAL") == "1":
+            st.sidebar.warning("Local test mode: no sign-in.")
+            return "zuha", "local"
+        html(f'<div class="lg-title">{ui.e(APP_TITLE)}</div>')
+        st.error("Sign-in isn't set up yet, so the ledger stays locked. Add the [auth] and [auth.google] sections to this app's secrets.")
+        st.stop()
+    if not st.user.is_logged_in:
+        html(f'<div class="lg-title" style="margin-top:8vh">{ui.e(APP_TITLE)}</div><p class="lg-note" style="font-size:15px">Sign in with your Google account to see the household ledger.</p>')
+        st.button("Sign in with Google", type="primary", on_click=st.login, args=("google",))
+        st.stop()
+    email = str(st.user.get("email", "")).lower()
+    if email not in people:
+        st.error(f"{email} isn't one of the ledger's accounts.")
+        st.button("Sign out", on_click=st.logout)
+        st.stop()
+    return people[email], email
 
 
-def fnv_id(s: str) -> str:
-    """Same id scheme as the original page (FNV-1a 32-bit, base 36), so re-imports dedupe against seeded data."""
-    h = 2166136261
-    for ch in s:
-        h ^= ord(ch)
-        h = (h * 16777619) & 0xFFFFFFFF
-    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-    if h == 0:
-        return "0"
-    out = ""
-    while h:
-        h, r = divmod(h, 36)
-        out = digits[r] + out
-    return out
+# ---------------------------------------------------------------- data
+@st.cache_resource
+def get_store():
+    if secret("google"):
+        return GoogleStore(secret("google"))
+    return LocalStore()
 
 
-def month_label(m: str) -> str:
-    import calendar
-    y, mo = m.split("-")
-    return f"{calendar.month_name[int(mo)]} {y}"
+@st.cache_data(ttl=60, show_spinner="Loading the ledger…")
+def load_data(_store, version: int) -> dict:
+    return _store.load()
 
 
-@dataclass
-class Ledger:
-    rules: dict = field(default_factory=empty_rules)
-    plan: dict = field(default_factory=lambda: {"budgets": {}, "byMonth": {}, "groups": {}})
-    projects: list = field(default_factory=list)
-    txns: list = field(default_factory=list)
-    fund_cfg: dict = field(default_factory=dict)
+def ledger_from(d: dict) -> Ledger:
+    cfg = d["config"]
+    return Ledger(rules=cfg.get("rules") or {}, plan=cfg.get("plan") or {"budgets": {}, "byMonth": {}, "groups": {}},
+                  projects=cfg.get("projects") or [], txns=d["txns"], fund_cfg=cfg.get("fund") or {})
 
-    def __post_init__(self):
-        self.rules = norm_rules(self.rules)
-        self.plan.setdefault("budgets", {})
-        self.plan.setdefault("byMonth", {})
-        self.plan.setdefault("groups", {})
 
-    # ---------- lookups ----------
-    def shift_rules(self) -> list[dict]:
-        """Merchants that bill at the end of a month for the next one (e.g. Ota Swim): charges on or after
-        `from_day` count toward the following month."""
-        r = self.rules.get("shift")
-        if r is None:
-            r = [{"match": "ota scuba swim", "from_day": 20, "label": "Ota Swim"}]
-        return [x for x in r if x and x.get("match")]
+def bump():
+    st.session_state["v"] = st.session_state.get("v", 0) + 1
+    load_data.clear()
 
-    @staticmethod
-    def _merchant_root(desc: str) -> str:
-        words = [w for w in learn_key(desc).split() if w not in {"www", "the", "card", "purchase"}]
-        return words[0] if words else ""
 
-    def refund_matches(self) -> dict[str, dict]:
-        """Refunds paired with the earlier charge they reverse: same account, same amount to the cent, same
-        merchant, charged within 60 days before. A refund counts in its charge's month so the two net to zero."""
-        sig = (len(self.txns), sum(1 for t in self.txns if t.get("spend", 0) < 0))
-        if getattr(self, "_refund_sig", None) == sig:
-            return self._refund_map
-        import datetime as _dt
-        day = lambda d: _dt.date.fromisoformat(d).toordinal()
-        charges: dict[tuple, list] = {}
-        for t in self.txns:
-            if t.get("spend", 0) > 0 and not t.get("synthetic"):
-                charges.setdefault((t.get("account"), round(t["spend"], 2), self._merchant_root(t.get("desc", ""))), []).append(t)
-        used, out = set(), {}
-        refunds = sorted((t for t in self.txns if t.get("spend", 0) < 0 and not t.get("synthetic")), key=lambda t: t["date"])
-        for r in refunds:
-            if "zelle" in str(r.get("desc", "")).lower() or self.contrib_of(r):
-                continue
-            root = self._merchant_root(r.get("desc", ""))
-            if not root:
-                continue
-            cands = [c for c in charges.get((r.get("account"), round(-r["spend"], 2), root), [])
-                     if c["id"] not in used and 0 <= day(r["date"]) - day(c["date"]) <= 60]
-            if cands:
-                c = max(cands, key=lambda c: c["date"])  # the most recent matching charge
-                used.add(c["id"])
-                out[r["id"]] = c
-        self._refund_sig, self._refund_map = sig, out
-        return out
+def fresh() -> tuple[dict, Ledger]:
+    """Read straight from storage before a write, so one person's save doesn't undo the other's."""
+    d = get_store().load()
+    return d, ledger_from(d)
 
-    def month_of(self, t: dict) -> str:
-        """The month a charge counts in: its own month, unless it was moved by hand, it's a refund of an earlier
-        charge (then it counts with that charge), or a next-month rule applies."""
-        if t.get("moved_from") or t.get("synthetic"):
-            return t["month"]
-        if t.get("spend", 0) < 0:
-            c = self.refund_matches().get(t.get("id"))
-            if c:
-                return self.month_of(c)
-        d = str(t.get("date") or "")
-        base = d[:7] or t.get("month", "")
-        key = learn_key(t.get("desc", ""))
-        for x in self.shift_rules():
-            if str(x["match"]).lower() in key and len(d) >= 10 and int(d[8:10]) >= int(x.get("from_day") or 20):
-                y, mo = int(base[:4]), int(base[5:7]) + 1
-                return f"{y + (mo > 12)}-{(mo - 1) % 12 + 1:02d}"
-        return base
 
-    def shifted(self, t: dict) -> bool:
-        return not t.get("moved_from") and not t.get("synthetic") and self.month_of(t) != str(t.get("date", ""))[:7]
+def save_config(key: str, value):
+    get_store().save_config(key, value)
+    bump()
 
-    def months(self) -> list[str]:
-        return sorted({self.month_of(t) for t in self.txns})
 
-    def deductions(self) -> list[dict]:
-        """Budget lines paid straight out of someone's paycheck, so they never appear on a statement.
-        Each counts as spent every month: the given amount, or that month's budget for the line."""
-        d = self.rules.get("deductions")
-        if d is None:  # not set yet: Zuha's health insurance comes out of her Remote pay
-            d = [{"line": "Health Insurance", "who": "zuha"}]
-        return [x for x in d if x and x.get("line")]
+DROP = object()  # marks a remembered field to forget
 
-    def deduction_txns(self, m: str) -> list[dict]:
-        out = []
-        for x in self.deductions():
-            amt = float(x.get("amount") or 0) or float(self.plan_for(m).get(x["line"]) or 0)
-            if amt:
-                who = x.get("who") or "zuha"
-                out.append({"id": f"ded:{m}:{x['line']}", "month": m, "date": f"{m}-01", "synthetic": True,
-                            "desc": f"{x['line']} (taken from {PEOPLE.get(who, who)}'s pay)", "spend": amt,
-                            "category": x["line"], "cat_override": x["line"], "account": "Paycheck deduction",
-                            "payer": who, "person": who if x.get("counts_toward") == "self" else None, "mk": ""})
-        return out
 
-    def split_rules(self) -> list[dict]:
-        """Charges that pay for more than one line. Default: Blackbend pays both girls' schools."""
-        r = self.rules.get("split")
-        if r is None:
-            r = [{"match": r"black\s*bend", "lines": ["Khadeeja", "Haniya's School"], "label": "Blackbend school payments"}]
-        return [x for x in r if x and x.get("match") and x.get("lines")]
-
-    def split_parts(self, t: dict) -> list[dict] | None:
-        """If a split rule applies, the charge's parts, one per line. A charge equal to one line's budget (within $5)
-        goes to that line alone; otherwise it's divided in proportion to the lines' budgets that month.
-        A line chosen by hand for the charge, or remembered for the merchant, wins over the split."""
-        if t.get("synthetic") or t.get("cat_override") or t.get("project") or self.learned(t).get("line") or self.learned(t).get("project"):
-            return None
-        d = str(t.get("desc") or "").lower()
-        for x in self.split_rules():
-            try:
-                if not re.search(x["match"], d):
+def remember_choices(learn: dict[str, dict], m: str) -> int:
+    """Save remembered merchant choices (line / who / big expense). A new choice applies to every month; changing or
+    forgetting an existing one only applies from month m on: earlier months keep what they had. Returns charges affected."""
+    d, LL = fresh()
+    rules = LL.rules
+    rules.setdefault("learn", {})
+    pinned: dict[str, dict] = {}
+    for key, upd in learn.items():
+        old = dict(rules["learn"].get(key) or {})
+        changing = {f for f, v in upd.items() if f in old and (v is DROP or v != old[f])}
+        if changing:
+            for t in LL.txns:
+                if learn_key(t.get("desc", "")) != key or LL.month_of(t) >= m:
                     continue
-            except re.error:
-                continue
-            have = set(self.budget_lines())
-            lines = [l for l in x["lines"] if l in have]
-            if not lines:
-                return None
-            plan = self.plan_for(self.month_of(t))
-            bud = {l: float(plan.get(l) or 0) for l in lines}
-            amt = float(t["spend"])
-            exact = [l for l in lines if bud[l] and abs(abs(amt) - bud[l]) <= 5]
-            if len(lines) == 1 or len(exact) == 1:
-                shares = {(exact or lines)[0]: 1.0}
+                pin = {}
+                if {"line", "project"} & changing and not t.get("cat_override") and not t.get("project"):
+                    pj = LL.proj_of(t)
+                    if pj and old.get("project"):
+                        pin["project"] = pj["id"]
+                    elif old.get("line"):
+                        pin["cat_override"] = LL.cat_of(t)
+                if "who" in changing and not t.get("person") and old.get("who"):
+                    pin["person"] = old["who"]
+                if pin:
+                    pinned.setdefault(t["id"], {}).update(pin)
+        new = {**old}
+        for f, v in upd.items():
+            if v is DROP or v in (None, ""):
+                new.pop(f, None)
             else:
-                tot = sum(bud.values())
-                shares = {l: (bud[l] / tot if tot else 1 / len(lines)) for l in lines}
-            parts, left = [], amt
-            items = list(shares.items())
-            for i, (l, f) in enumerate(items):
-                a = round(amt * f, 2) if i < len(items) - 1 else round(left, 2)
-                left -= a
-                parts.append({**t, "id": f"{t['id']}#{i}", "split_of": t["id"], "cat_override": l, "spend": a,
-                              "split_note": x.get("label") or "split"})
-            return parts
-        return None
-
-    def month_txns(self, m: str, with_deductions: bool = True, split: bool = True) -> list[dict]:
-        own = [t for t in self.txns if self.month_of(t) == m]
-        if split:
-            own = [p for t in own for p in (self.split_parts(t) or [t])]
-        return own + (self.deduction_txns(m) if with_deductions and own else [])
-
-    def plan_for(self, m: str) -> dict:
-        return self.plan["byMonth"].get(m) or self.plan["budgets"]
-
-    def budget_lines(self) -> list[str]:
-        s = set(self.plan["budgets"])
-        for v in self.plan["byMonth"].values():
-            s |= set(v)
-        return sorted(s, key=str.lower)
-
-    def all_categories(self, m: str | None = None) -> list[str]:
-        s = set(self.plan["budgets"]) | (set(self.plan_for(m)) if m else set())
-        for t in self.txns:
-            s.add(self.cat_of(t))
-        return sorted(s, key=str.lower)
-
-    def accounts(self) -> list[str]:
-        return sorted({t["account"] for t in self.txns if t.get("account")})
-
-    def section_of(self, cat: str) -> str:
-        g = self.plan["groups"].get(cat)
-        return g if any(k == g for k, _ in SECTIONS) else "other"
-
-    # ---------- classification ----------
-    def pat_cat(self, t: dict) -> str | None:
-        d = str(t.get("desc") or "").lower().replace("-", "")
-        for r in self.rules.get("patcat") or []:
-            if not r or not r.get("match") or not r.get("cat"):
-                continue
-            try:
-                if re.search(r"\b" + r["match"] + r"\b", d) and not (r.get("not") and re.search(r["not"], d)):
-                    return r["cat"]
-            except re.error:
-                continue
-        return None
-
-    def learned(self, t: dict) -> dict:
-        return (self.rules.get("learn") or {}).get(learn_key(t.get("desc", ""))) or {}
-
-    def never_spending(self, t: dict) -> str | None:
-        """Lines that must never count as spending, whatever a category or remembered choice says:
-        card payments, transfers between your own accounts, and money between you on Aneeq's accounts
-        (it's already counted once, from Zuha's side)."""
-        if t.get("synthetic"):
-            return None
-        d = str(t.get("desc") or "")
-        if self.payer_of(t) == "aneeq" and MONEY_MOVE.search(d) and SPOUSE_NAME["zuha"].search(d):
-            return "Transfer"
-        if CARD_PAYMENT.search(d):
-            return "Credit Card Payment"
-        other = {"zuha": "aneeq", "aneeq": "zuha"}.get(self.payer_of(t) or "")
-        if OWN_TRANSFER.search(d) and other and not SPOUSE_NAME[other].search(d):
-            return "Transfer"
-        return None
-
-    def cat_of(self, t: dict) -> str:
-        return (t.get("cat_override") or self.never_spending(t) or self.learned(t).get("line") or self.pat_cat(t) or self.rules["recat"].get(t.get("mk", ""))
-                or self.rules["catmap"].get(t.get("category", "")) or t.get("category") or "Uncategorized")
-
-    def is_excluded(self, cat: str) -> bool:
-        v = self.rules["exclude"].get(cat)
-        if v is True or v is False:
-            return v
-        return bool(DEFAULT_EXCLUDE.search(cat or ""))
-
-    def resolve(self, t: dict) -> tuple[str | None, str]:
-        if t.get("person"):
-            return t["person"], "this transaction only"
-        if self.learned(t).get("who"):
-            return self.learned(t)["who"], "remembered for this merchant"
-        mk = t.get("mk", "")
-        if self.rules["merchant"].get(mk):
-            return self.rules["merchant"][mk], "merchant rule"
-        if t.get("account") and self.rules["account"].get(t["account"]):
-            return self.rules["account"][t["account"]], "account rule"
-        c = self.cat_of(t)
-        if self.rules["category"].get(c):
-            return self.rules["category"][c], "line owner"
-        return None, "not assigned yet"
-
-    def payer_of(self, t: dict) -> str | None:
-        return t.get("payer") or self.rules["payer"].get(t.get("account") or "") or None
-
-    def contrib_of(self, t: dict) -> dict | None:
-        """Money one of you sent the other, counted once and only on Zuha's side:
-        from Aneeq = money coming INTO one of Zuha's accounts; from Zuha = money going OUT of one of her accounts.
-        The same transfer on Aneeq's own account is ignored, so it's never counted twice, and a description
-        match in the wrong direction (e.g. a payment that merely mentions Wells Fargo) doesn't count."""
-        if not t.get("spend") or t.get("not_between"):
-            return None
-        if self.payer_of(t) == "aneeq":
-            return None
-        d = str(t.get("desc") or "").lower()
-        for r in self.rules.get("contrib") or []:
-            if not (r and r.get("match") and str(r["match"]).lower() in d):
-                continue
-            if r.get("from") == "aneeq" and t["spend"] < 0:
-                return r
-            if r.get("from") == "zuha" and t["spend"] > 0:
-                return r
-        return None
-
-    def transfers(self, m: str) -> list[dict]:
-        """Every transaction counted as money between you in month m."""
-        return [{**t, "dir": self.contrib_of(t)["from"]} for t in self.month_txns(m, with_deductions=False) if self.contrib_of(t)]
-
-    # ---------- big expenses ----------
-    def proj_by_id(self, pid: str | None) -> dict | None:
-        return next((p for p in self.projects if p.get("id") == pid), None) if pid else None
-
-    def proj_rules(self) -> list[dict]:
-        """Charges that always count toward a big expense, matched on the description (a regular expression).
-        Default: PayPal pay-later repayments from Chase and Wayfair go to Furniture."""
-        r = self.rules.get("projrule")
-        if r is None:
-            r = [{"match": r"pypl\s*paymthly|paypal\s*pay\s*monthly|pay\s*in\s*4|payin4|wayfair", "project": "furniture",
-                  "label": "PayPal pay-later & Wayfair"}]
-        return [x for x in r if x and x.get("match") and self.proj_by_id(x.get("project"))]
-
-    def proj_of(self, t: dict) -> dict | None:
-        if t.get("synthetic"):
-            return None
-        if t.get("project"):
-            return self.proj_by_id(t["project"])  # "none" means taken off a big expense on purpose
-        lrn = self.learned(t)
-        pid = lrn.get("project")
-        if pid and self.proj_by_id(pid):
-            return self.proj_by_id(pid)
-        if lrn.get("line"):  # a remembered budget line wins over the automatic big-expense rules
-            return None
-        d = str(t.get("desc") or "").lower()
-        for x in self.proj_rules():
-            try:
-                if re.search(x["match"], d):
-                    return self.proj_by_id(x["project"])
-            except re.error:
-                continue
-        return None
-
-    @staticmethod
-    def fund_amt(f: dict) -> float:
-        if f.get("months"):
-            return sum(float(v or 0) for v in f["months"].values())
-        return float(f.get("amount") or 0)
-
-    def fund_owner(self, f: dict) -> str:
-        if f.get("line"):
-            return self.rules["category"].get(f["line"]) or "shared"
-        return f.get("owner") or "shared"
-
-    def proj_stats(self, p: dict) -> dict:
-        est = sum(float(i.get("est") or 0) for i in p.get("items") or [])
-        fz = fa = 0.0
-        for f in p.get("funding") or []:
-            a, o = self.fund_amt(f), self.fund_owner(f)
-            if o == "zuha":
-                fz += a
-            elif o == "aneeq":
-                fa += a
-            else:
-                fz += a / 2
-                fa += a / 2
-        funded = fz + fa
-        short = est - funded
-        base = funded + max(0.0, short)
-        plan_pct = (fz + max(0.0, short) / 2) / base if base else 0.5
-        sp = p.get("split") or "even"
-        if sp == "custom":
-            z_pct = min(1.0, max(0.0, float(p.get("zuha_pct") or 50) / 100))
+                new[f] = v
+        if new:
+            rules["learn"][key] = new
         else:
-            z_pct = {"zuha": 1.0, "aneeq": 0.0, "plan": plan_pct}.get(sp, 0.5)  # default: 50:50
-        txns = sorted([t for t in self.txns if (self.proj_of(t) or {}).get("id") == p["id"] and not self.contrib_of(t)], key=lambda t: t["date"])
-        spent = sum(t["spend"] for t in txns)
-        names = {i["name"] for i in p.get("items") or []}
-        by_item: dict[str, float] = {}
-        unmatched = 0.0
-        for t in txns:
-            if t.get("proj_item") in names:
-                by_item[t["proj_item"]] = by_item.get(t["proj_item"], 0) + t["spend"]
+            rules["learn"].pop(key, None)
+    get_store().save_config("rules", rules)
+    if pinned:
+        for t in d["txns"]:
+            if t["id"] in pinned:
+                t.update(pinned[t["id"]])
+        get_store().save_txns(d["txns"])
+    bump()
+    return sum(1 for t in LL.txns if learn_key(t.get("desc", "")) in learn and LL.month_of(t) >= m)
+
+
+def keep_past_plans(plan: dict, months_with_data: list[str], m: str):
+    """Before changing the standard plan from month m on, give earlier months that used it their own copy,
+    so their budgets don't change after the fact."""
+    for k in months_with_data:
+        if k < m and k not in plan["byMonth"]:
+            plan["byMonth"][k] = dict(plan["budgets"])
+
+
+def update_txns(changes: dict[str, dict]):
+    d, _ = fresh()
+    for t in d["txns"]:
+        for k, v in changes.get(t["id"], {}).items():
+            if v in (None, ""):
+                t.pop(k, None)
             else:
-                unmatched += t["spend"]
-        return {"est": est, "funded": funded, "fz": fz, "fa": fa, "short": short, "plan_pct": plan_pct,
-                "z_pct": z_pct, "spent": spent, "txns": txns, "by_item": by_item, "unmatched": unmatched}
+                t[k] = v
+    get_store().save_txns(d["txns"])
+    bump()
 
-    def tx_z_share(self, t: dict, pj: dict) -> float:
-        it = next((i for i in pj.get("items") or [] if i.get("name") == t.get("proj_item")), None) if t.get("proj_item") else None
-        if it and it.get("who"):
-            return {"zuha": 1.0, "aneeq": 0.0}.get(it["who"], 0.5)
-        return self.proj_stats(pj)["z_pct"]
 
-    def asides_for(self, m: str) -> dict[str, list[dict]]:
-        """Money reserved on regular lines for big expenses. Replaced by the Extras II fund, so nothing is reserved
-        any more (kept so older saved plans still load)."""
-        if True:
-            return {}
-        out: dict[str, list[dict]] = {}
-        for p in self.projects:
-            for f in p.get("funding") or []:
-                if f.get("line") and f.get("months") and float(f["months"].get(m) or 0):
-                    out.setdefault(f["line"], []).append({"name": p["name"], "amt": float(f["months"][m])})
-        return out
+# ---------------------------------------------------------------- pages
+def html(x: str):
+    st.markdown(x, unsafe_allow_html=True)
 
-    # ---------- month math ----------
-    def compute(self, m: str) -> dict:
-        cats: dict[str, dict] = {}
-        tot = dict(zuha=0.0, aneeq=0.0, shared=0.0, none=0.0, all=0.0)
-        paid = dict(zuha=0.0, aneeq=0.0, shared=0.0, unset=0.0)
-        settle = dict(net=0.0, skipped=0.0, aneeq_to_zuha=0.0, zuha_to_aneeq=0.0, big=0.0, aneeq_for_big=0.0,
-                      by={"Home Budget": 0.0, "Extras I": 0.0, DEFAULT_SECTION: 0.0, "other": 0.0}, x2_total=0.0, x2_aneeq=0.0)
-        unassigned = 0
 
-        def new_row(c):
-            return {"cat": c, "zuha": 0.0, "aneeq": 0.0, "shared": 0.0, "none": 0.0, "all": 0.0,
-                    "paid": dict(zuha=0.0, aneeq=0.0, shared=0.0, unset=0.0)}
+def close_month_toggle(L: Ledger, m: str, key: str):
+    fs = L.fund_settings()
+    closed = m in fs["closed"]
+    val = st.checkbox(f"All of {month_label(m)}'s statements are in: count its Core and Extras I leftover toward the Extras II fund",
+                      value=closed, key=key)
+    if val != closed:
+        f = fresh()[1].fund_settings()
+        f["closed"] = sorted(set(f["closed"]) | {m}) if val else [x for x in f["closed"] if x != m]
+        save_config("fund", f)
+        st.rerun()
 
-        share = lambda who, x: x if who == "zuha" else x / 2 if who == "shared" else 0.0
-        for t in self.month_txns(m):
-            cb = self.contrib_of(t)
-            if cb:
-                amt = abs(t["spend"])
-                if cb.get("from") == "aneeq":
-                    settle["aneeq_to_zuha"] += amt
-                    settle["net"] -= amt
-                    if self.proj_of(t):
-                        settle["aneeq_for_big"] += amt
+
+def page_overview(L: Ledger, m: str):
+    html(ui.summary(L, m))
+    html(ui.sections(L, m))
+    html('<div class="lg-h2">Extras II fund</div>')
+    html(ui.fund_panel(L, m, compact=True))
+    close_month_toggle(L, m, f"close-ov-{m}")
+
+
+def page_budget(L: Ledger, m: str, person: str = "zuha"):
+    t_line, t_person, t_edit = st.tabs(["By line", "By person", "Edit or add lines"])
+    with t_line:
+        html(ui.budget(L, m).replace('<div class="lg-h2">', '<div class="lg-h2" style="margin-top:4px">', 1))
+    with t_person:
+        html(f'<div class="lg-h2" style="margin-top:4px">Budget check by person, {ui.e(month_label(m))}</div>')
+        names = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}
+        who_label = st.segmented_control("Person", list(names.values()), default=names.get(person, names["zuha"]),
+                                         key="budget-person", label_visibility="collapsed") or names.get(person, names["zuha"])
+        who = next(k for k, v in names.items() if v == who_label)
+        html(ui.person_budget(L, m, who))
+    own = m in L.plan["byMonth"]
+    rows = L.budget_rows(m)
+    SEC_LABEL = {k: l for k, l in SECTIONS}
+    SEC_KEY = {l: k for k, l in SECTIONS}
+    NOT_ON = "Not in the budget"
+
+    exp = t_edit
+    exp.markdown("**Edit budget lines: amount, section, whose**")
+    exp.caption((f"{month_label(m)} has its own plan from your budget sheet; amount changes apply to this month only."
+                 if own else f"This month uses your standard plan; amount changes apply from {month_label(m)} on. Earlier months keep their budgets.")
+                + " Section and whose apply to every month. Set an amount to 0 to take a line off this month's budget.")
+    df = pd.DataFrame([{
+        "Section": SEC_LABEL.get(L.plan["groups"].get(r["cat"]), NOT_ON), "Line": r["cat"],
+        "Whose": WHO_NAME.get(r["owner"], "") if r["owner"] else "", "Budget": r["planned"], "Spent": r["all"],
+    } for r in rows], columns=["Section", "Line", "Whose", "Budget", "Spent"])
+    if not df.empty:
+        edited = exp.data_editor(df, hide_index=True, width="stretch", key=f"bud-{m}",
+                                 column_config={"Section": st.column_config.SelectboxColumn(options=[l for _, l in SECTIONS] + [NOT_ON]),
+                                                "Line": st.column_config.TextColumn(disabled=True),
+                                                "Whose": st.column_config.SelectboxColumn(options=WHO_OPTS),
+                                                "Budget": st.column_config.NumberColumn(format="$%.0f", min_value=0),
+                                                "Spent": st.column_config.NumberColumn(format="$%.0f", disabled=True)})
+        if exp.button("Save budget changes", type="primary", key="bud-save"):
+            _, LL = fresh()
+            plan, rules = LL.plan, LL.rules
+            if not own:
+                keep_past_plans(plan, LL.months(), m)
+            tgt = plan["byMonth"][m] if own else plan["budgets"]
+            for _, r in edited.iterrows():
+                line = r["Line"]
+                v = float(r["Budget"] or 0)
+                if v:
+                    tgt[line] = v
                 else:
-                    settle["zuha_to_aneeq"] += amt
-                    settle["net"] += amt
-                continue
-            pj = self.proj_of(t)
-            if pj:
-                pay = self.payer_of(t)
-                zp = self.tx_z_share(t, pj)
-                paid[pay or "unset"] += t["spend"]
-                settle["big"] += t["spend"]
-                if pay:
-                    pz = 1.0 if pay == "zuha" else 0.5 if pay == "shared" else 0.0
-                    settle["net"] += (pz - zp) * t["spend"]
-                    sec = pj.get("section") or DEFAULT_SECTION
-                    settle["by"][sec if sec in settle["by"] else "other"] += (pz - zp) * t["spend"]
-                    if sec == DEFAULT_SECTION:
-                        settle["x2_total"] += t["spend"]
-                        settle["x2_aneeq"] += (1 - pz) * t["spend"]
+                    tgt.pop(line, None)
+                if r["Section"] in SEC_KEY:
+                    plan["groups"][line] = SEC_KEY[r["Section"]]
                 else:
-                    settle["skipped"] += t["spend"]
-                continue
-            c = self.cat_of(t)
-            if self.is_excluded(c):
-                continue
-            p, _ = self.resolve(t)
-            k = p or "none"
-            if not p:
-                unassigned += 1
-            row = cats.setdefault(c, new_row(c))
-            row[k] += t["spend"]
-            row["all"] += t["spend"]
-            tot[k] += t["spend"]
-            tot["all"] += t["spend"]
-            pay = self.payer_of(t)
-            row["paid"][pay or "unset"] += t["spend"]
-            paid[pay or "unset"] += t["spend"]
-            if p and pay:
-                settle["net"] += share(pay, t["spend"]) - share(p, t["spend"])
-                settle["by"][self.section_of(c)] += share(pay, t["spend"]) - share(p, t["spend"])
-                if self.section_of(c) == DEFAULT_SECTION:
-                    settle["x2_total"] += t["spend"]
-                    settle["x2_aneeq"] += t["spend"] if pay == "aneeq" else t["spend"] / 2 if pay == "shared" else 0.0
+                    plan["groups"].pop(line, None)
+                who = WHO_KEY.get(r["Whose"] or "")
+                if who:
+                    rules["category"][line] = who
+                else:
+                    rules["category"].pop(line, None)
+            save_config("plan", plan)
+            save_config("rules", rules)
+            st.session_state["bud-flash"] = "Budget saved."
+            st.rerun()
+
+    with t_edit, st.expander("✎ Rename a line, or send a merchant's charges to it"):
+        with st.form("rename-line"):
+            cur_lines = [l for l in L.budget_lines() if not L.is_excluded(l)]
+            c1, c2 = st.columns(2)
+            old = c1.selectbox("Line", cur_lines)
+            new = c2.text_input("New name (leave blank to keep the name)")
+            match = st.text_input("Charges whose description contains (optional)", placeholder="e.g. montessori haven",
+                                  help="Every charge with these words goes to this line, in all months, unless you picked a line for that charge by hand.")
+            ok_r = st.form_submit_button("Save", type="primary")
+        if ok_r:
+            new = (new or "").strip()
+            existing = {x.lower() for x in L.budget_lines()} | {x.lower() for x in L.plan["groups"]}
+            if new and new.lower() != old.lower() and new.lower() in existing:
+                st.error(f"There's already a line called “{new}”.")
+            elif new and L.is_excluded(new):
+                st.error("That name looks like a transfer or payment, which isn't counted as spending. Pick another name.")
+            elif not new and not match.strip():
+                st.error("Type a new name, or words to match, or both.")
             else:
-                settle["skipped"] += t["spend"]
-        for c, v in self.plan_for(m).items():
-            if c not in cats and float(v or 0) > 0 and not self.is_excluded(c):
-                cats[c] = new_row(c)
-        return {"cats": list(cats.values()), "tot": tot, "paid": paid, "settle": settle, "unassigned": unassigned}
+                d0, LL = fresh()
+                plan, rules, projects = LL.plan, LL.rules, LL.projects
+                target = new or old
+                changes = rename_line(plan, rules, projects, d0["txns"], old, new) if new and new != old else {}
+                msg = [f"Renamed “{old}” to “{new}” everywhere"] if changes is not None and new and new != old else []
+                words = " ".join(match.lower().split())
+                if words:
+                    pat = r"\s*".join(re.escape(w) for w in words.split())
+                    rules["patcat"] = [r for r in rules.get("patcat") or [] if r.get("match") != pat] + \
+                                      [{"match": pat, "cat": target, "label": match.strip().title()}]
+                    msg.append(f"charges containing “{match.strip()}” now go to {target}")
+                save_config("plan", plan)
+                save_config("rules", rules)
+                save_config("projects", projects)
+                if changes:
+                    update_txns(changes)
+                flash = "; ".join(msg)
+                st.session_state["bud-flash"] = flash[:1].upper() + flash[1:] + "."
+                st.rerun()
 
-    def budget_rows(self, m: str) -> list[dict]:
-        """One row per budget line / category for the month, ordered by section like the sheet."""
-        res = self.compute(m)
-        bm, asides = self.plan_for(m), self.asides_for(m)
-        order = {k: i for i, (k, _) in enumerate(SECTIONS)}
-        rows = []
-        for r in res["cats"]:
-            planned = float(bm.get(r["cat"]) or 0)
-            ad = asides.get(r["cat"], [])
-            ad_sum = sum(a["amt"] for a in ad)
-            avail = max(0.0, planned - ad_sum)
-            g = self.plan["groups"].get(r["cat"]) or ("Other budget lines" if planned else "Not in the budget")
-            rows.append({**r, "section": g, "planned": planned, "set_aside": ad_sum,
-                         "set_aside_for": ", ".join(f"{a['name']} {a['amt']:,.0f}" for a in ad),
-                         "available": avail, "left": avail - r["all"], "owner": self.rules["category"].get(r["cat"]),
-                         "_o": order.get(g, 50 if g == "Other budget lines" else 99)})
-        rows.sort(key=lambda x: (x["_o"], -x["planned"], -x["all"], x["cat"].lower()))
-        return rows
+    with t_edit, st.expander("＋ Add a budget line"):
+        with st.form("add-line", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Name", placeholder="e.g. Gym, Car maintenance, Gifts")
+            amt = c2.number_input("Monthly amount", min_value=0.0, step=25.0, format="%.2f")
+            c3, c4, c5 = st.columns(3)
+            sec = c3.selectbox("Section", [l for _, l in SECTIONS], index=0)
+            whose = c4.selectbox("Whose", ["🟡 Shared (50:50)", "🟣 Zuha", "🔵 Aneeq"], index=0,
+                                 help="Extras II lines are shared; Core and Extras I lines usually belong to one of you")
+            when = c5.selectbox("Applies", [f"From {month_label(m)} on", f"Only {month_label(m)}"])
+            ok = st.form_submit_button("Add line", type="primary")
+        if ok:
+            name = name.strip()
+            existing = {x.lower() for x in L.budget_lines()} | {x.lower() for x in L.plan["groups"]}
+            if not name:
+                st.error("Give the line a name.")
+            elif name.lower() in existing:
+                st.error(f"There's already a line called “{name}”. Change its amount in Edit budget lines instead.")
+            elif L.is_excluded(name):
+                st.error("That name looks like a transfer or payment, which isn't counted as spending. Pick another name.")
+            else:
+                _, LL = fresh()
+                plan, rules = LL.plan, LL.rules
+                if when.startswith("Only"):
+                    if m not in plan["byMonth"]:
+                        plan["byMonth"][m] = dict(plan["budgets"])
+                    plan["byMonth"][m][name] = float(amt)
+                else:
+                    keep_past_plans(plan, LL.months(), m)
+                    plan["budgets"][name] = float(amt)
+                    for k in plan["byMonth"]:
+                        if k >= m:
+                            plan["byMonth"][k][name] = float(amt)
+                plan["groups"][name] = SEC_KEY[sec]
+                rules["category"][name] = {"🟡 Shared (50:50)": "shared", "🟣 Zuha": "zuha", "🔵 Aneeq": "aneeq"}[whose]
+                save_config("plan", plan)
+                save_config("rules", rules)
+                st.session_state["bud-flash"] = (f"Added “{name}” ({ui.m(amt)}/month, {sec}). Charges can be put on it from the "
+                                                 "Transactions or Not in budget tab.")
+                st.rerun()
+    if st.session_state.get("bud-flash"):
+        st.success(st.session_state.pop("bud-flash"))
 
-    def section_matrix(self, m: str) -> dict:
-        rows: dict[str, dict] = {}
-        z = lambda: dict(zuha=0.0, aneeq=0.0, shared=0.0, unset=0.0)
 
-        def add(key, who, amt):
-            rows.setdefault(key, z())[who] += amt
+def page_transactions(L: Ledger, m: str, person: str):
+    html(f'<div class="lg-h2" style="margin-top:4px">Transactions, {ui.e(month_label(m))}</div>')
+    show = st.radio("Show", ["All", "Needs a person", "Big expenses", "Money between you", "Not counted"],
+                    horizontal=True, key="txfilter")
+    q = st.text_input("Search merchant, line or account", key="txsearch").lower()
+    proj_label = {p["id"]: "★ " + p["name"] for p in L.projects}
+    label_proj = {v: k for k, v in proj_label.items()}
+    lines = L.all_categories(m)
+    line_opts = [NO_LINE] + lines + list(proj_label.values())
+    items = sorted({i["name"] for p in L.projects for i in p.get("items") or []})
 
-        for t in self.month_txns(m):
-            if self.contrib_of(t):
+    recs, ids = [], []
+    deds = L.deduction_txns(m) if L.month_txns(m, with_deductions=False) else []
+    if deds:
+        html('<p class="lg-note" style="margin:0 0 8px">Also counted this month, without a statement: '
+             + " · ".join(f'{ui.e(t["desc"])} {ui.m(t["spend"])}' for t in deds) + '. Change these in Rules → Taken from pay.</p>')
+    for t in sorted(L.month_txns(m, with_deductions=False, split=False), key=lambda t: t["date"], reverse=True):
+        cb, pj, c = L.contrib_of(t), L.proj_of(t), L.cat_of(t)
+        sp = L.split_parts(t)
+        ex = L.is_excluded(c) and not cb and not pj
+        who, why = L.resolve(t)
+        if cb:
+            status = f"Money from {PEOPLE[cb['from']]}" + (f" for {pj['name']}" if pj else f" for {t['for_line']}" if t.get("for_line") else "") + " · settle-up"
+        elif pj:
+            status = f"Big expense: {pj['name']}"
+        elif sp:
+            status = "Split: " + " · ".join(f"{x['cat_override']} {ui.m(x['spend'], True)}" for x in sp) + " (set a Line to override)"
+        elif ex and L.never_spending(t) and not t.get("cat_override"):
+            d = t.get("desc") or ""
+            status = ("Not counted: money between you, already counted from Zuha's side" if L.payer_of(t) == "aneeq" and L.never_spending(t) == "Transfer" and ("zuha" in d.lower() or "shaikh" in d.lower())
+                      else "Not counted: paying off a card (its charges are counted)" if L.never_spending(t) == "Credit Card Payment"
+                      else "Not counted: moving money between your own accounts")
+        elif ex:
+            status = "Not counted as spending"
+        elif L.learned(t).get("line") and not t.get("cat_override"):
+            status = "Line remembered · " + why
+        else:
+            status = why
+        orig = L.refund_matches().get(t["id"]) if t["spend"] < 0 else None
+        if orig:
+            status = f"Refund of the {orig['date']} charge · counts in {month_label(L.month_of(orig))} · " + status
+        elif L.shifted(t):
+            status = f"Counts in {month_label(L.month_of(t))} (billed for next month) · " + status
+        keep = {"Needs a person": not (who or ex or cb or pj), "All": True, "Big expenses": bool(pj and not cb),
+                "Money between you": bool(cb) or bool(t.get("not_between")), "Not counted": ex}[show]
+        if not keep or (q and q not in f"{t['desc']} {c} {t.get('account','')}".lower()):
+            continue
+        line_val = proj_label.get(pj["id"]) if pj else ((t.get("for_line") or NO_LINE) if cb else (NO_LINE if sp else c))
+        recs.append({"Date": t["date"], "Merchant": t["desc"], "Paid from": PAID_NAME.get(L.payer_of(t) or "", "⚪ not set"),
+                     "Amount": t["spend"], "Line": line_val,
+                     "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
+                     "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False,
+                     "Not between us": bool(t.get("not_between")), "Status": status})
+        ids.append(t["id"])
+    if not recs:
+        st.info("Nothing here.")
+        return
+    html('<p class="lg-note" style="margin:0 0 8px">Change a charge&#39;s <b>Line</b> or <b>Who</b> and press Save. '
+         'Choose ★ in Line to put a charge under a big expense.</p>')
+    df = pd.DataFrame(recs)
+    edited = st.data_editor(
+        df, hide_index=True, width="stretch", key=f"tx-{m}-{show}-{q}",
+        column_config={
+            "Date": st.column_config.TextColumn(disabled=True, width="small"),
+            "Merchant": st.column_config.TextColumn(disabled=True, width="large"),
+            "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
+            "Amount": st.column_config.NumberColumn(format="dollar", disabled=True, width="small"),
+            "Line": st.column_config.SelectboxColumn(options=line_opts, help="Budget line, or ★ a big expense"),
+            "Who": st.column_config.SelectboxColumn(options=[UNSET] + WHO_OPTS[1:] + [NO_ITEM], help="Whose budget this counts toward"),
+            "Item": st.column_config.SelectboxColumn(options=[NO_ITEM] + items, help="Big-expense item"),
+            "Only this charge": st.column_config.CheckboxColumn(help="Tick to change just this charge. Otherwise the choice is remembered for the merchant from now on."),
+            "Not between us": st.column_config.CheckboxColumn(help="Tick if this was matched as money between you but isn't (e.g. a payment that just mentions Wells Fargo)."),
+            "Status": st.column_config.TextColumn(disabled=True)})
+    html('<p class="lg-note" style="margin:6px 0">Changes are remembered for the merchant: this month, later months and future statements. '
+         'Earlier months keep what they had. To forget a remembered choice, set Line to — or Who to ⚪ Not set. '
+         'Tick <b>Only this charge</b> for a one-off exception.</p>')
+    if st.button("Save changes", type="primary", key="save-tx"):
+        changes: dict[str, dict] = {}
+        learn: dict[str, dict] = {}
+        byid = {t["id"]: t for t in L.txns}
+        for i, (_, new) in enumerate(edited.iterrows()):
+            old, t = df.iloc[i], byid[ids[i]]
+            ch = {}
+            cb = L.contrib_of(t)
+            key = learn_key(t["desc"])
+            once = bool(new.get("Only this charge"))
+            if new["Line"] != old["Line"] and new["Line"]:
+                if new["Line"] == NO_LINE:
+                    if cb:
+                        ch["for_line"] = None
+                    elif once:
+                        ch["cat_override"] = None
+                        ch["project"] = None
+                    else:
+                        learn.setdefault(key, {}).update(line=DROP, project=DROP)
+                        ch["cat_override"] = None
+                        ch["project"] = None
+                elif new["Line"] in label_proj:
+                    if cb or once:
+                        ch["project"] = label_proj[new["Line"]]
+                        if cb:
+                            ch["for_line"] = None
+                    else:
+                        learn.setdefault(key, {}).update(project=label_proj[new["Line"]], line=DROP)
+                        ch["project"] = None
+                        ch["cat_override"] = None
+                else:
+                    ch["proj_item"] = None
+                    if cb:
+                        ch["for_line"] = new["Line"]
+                    elif once:
+                        ch["cat_override"] = new["Line"]
+                        ch["project"] = "none" if L.proj_of({**t, "project": None}) else None
+                    else:
+                        learn.setdefault(key, {}).update(line=new["Line"], project=DROP)
+                        ch["cat_override"] = None
+                        ch["project"] = None
+            if new["Who"] != old["Who"] and not cb and new["Who"] != NO_ITEM:
+                who = WHO_KEY.get(new["Who"] or "") if new["Who"] != UNSET else None
+                if once:
+                    ch["person"] = who
+                else:
+                    learn.setdefault(key, {})["who"] = who if who else DROP
+                    ch["person"] = None
+            if bool(new.get("Not between us")) != bool(old.get("Not between us")):
+                ch["not_between"] = "1" if new.get("Not between us") else None
+            if (new["Item"] or NO_ITEM) != (old["Item"] or NO_ITEM):
+                ch["proj_item"] = None if new["Item"] in (None, "", NO_ITEM) else new["Item"]
+            if ch:
+                changes[t["id"]] = ch
+        if changes:
+            update_txns(changes)
+        n = remember_choices(learn, m) if learn else 0
+        if learn or changes:
+            st.session_state["flash"] = (f"Saved. Remembered choices updated for {len(learn)} merchant{'s' if len(learn) != 1 else ''}; "
+                                         "they apply to future statements too."
+                                         if learn else f"Saved {len(changes)} change{'s' if len(changes) != 1 else ''} to just those charges.")
+            st.rerun()
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+
+
+def page_unbudgeted(L: Ledger, m: str | None):
+    """Counted spending that isn't on any budget line, with a way to put each charge on one."""
+    html('<div class="lg-h2" style="margin-top:4px">Not in the budget</div>'
+         '<p class="lg-note" style="margin:0 0 10px">Spending that doesn&#39;t fall on any line of your budget sheet '
+         '(e.g. Other, Subscriptions, Charity). Pick a budget line under <b>Assign to</b> and press Save.</p>')
+    budget_lines = [l for l in L.budget_lines() if not L.is_excluded(l)]
+    scope = st.radio("Show", [f"{month_label(m)}" if m else "This month", "All months"], horizontal=True, key="nib-scope")
+    months = L.months() if scope == "All months" or not m else [m]
+    rows = []
+    for mo in months:
+        for t in L.month_txns(mo, with_deductions=False):
+            if L.contrib_of(t) or L.proj_of(t):
                 continue
-            pay = self.payer_of(t) or "unset"
-            pj = self.proj_of(t)
-            if pj:
-                add("big:" + (pj.get("section") or DEFAULT_SECTION), pay, t["spend"])
-                add("proj:" + pj["id"], pay, t["spend"])
+            c = L.cat_of(t)
+            if L.is_excluded(c) or c in budget_lines:
                 continue
-            c = self.cat_of(t)
-            if self.is_excluded(c):
+            rows.append((t, c))
+    rows.sort(key=lambda x: x[0]["date"], reverse=True)
+    if not rows:
+        st.success("Everything counted as spending is on a budget line.")
+        return
+    total = sum(t["spend"] for t, _ in rows)
+    by_cat: dict[str, float] = {}
+    by_who: dict[str, float] = {}
+    for t, c in rows:
+        by_cat[c] = by_cat.get(c, 0) + t["spend"]
+        w = L.payer_of(t) or "unset"
+        by_who[w] = by_who.get(w, 0) + t["spend"]
+    chips = " · ".join(f'{ui.e(c)} <b class="num">{ui.m(v)}</b>' for c, v in sorted(by_cat.items(), key=lambda x: -x[1]))
+    paid = " · ".join(f'<span class="dot d-{w}"></span>{ {"zuha": "Zuha", "aneeq": "Aneeq", "shared": "Joint"}.get(w, "Payer not set") } <b class="num">{ui.m(v)}</b>'
+                      for w, v in sorted(by_who.items(), key=lambda x: -x[1]))
+    html(f'<div class="lg-summary" style="grid-template-columns:minmax(0,1fr) minmax(0,2fr)">'
+         f'<div><span class="lg-eyebrow">Not in the budget</span><span class="big num">{ui.m(total)}</span>'
+         f'<span class="lg-muted" style="font-size:13px">{len(rows)} charge{"s" if len(rows) != 1 else ""}</span></div>'
+         f'<div><span class="lg-eyebrow">By category</span><span style="font-size:14px">{chips}</span>'
+         f'<span class="lg-eyebrow" style="margin-top:6px">Paid from</span><span style="font-size:14px">{paid}</span></div></div>')
+
+    KEEP = "— keep as is —"
+    df = pd.DataFrame([{"Date": t["date"], "Merchant": t["desc"], "Amount": t["spend"],
+                        "Paid from": PAID_NAME.get(L.payer_of(t) or "", UNSET), "Account": t.get("account", ""),
+                        "Category now": c, "Assign to": KEEP, "Only this charge": False} for t, c in rows])
+    ids = [t["id"] for t, _ in rows]
+    ed = st.data_editor(df, hide_index=True, width="stretch", key=f"nib-{scope}-{m}",
+                        column_config={"Date": st.column_config.TextColumn(disabled=True, width="small"),
+                                       "Merchant": st.column_config.TextColumn(disabled=True, width="large"),
+                                       "Amount": st.column_config.NumberColumn(format="dollar", disabled=True, width="small"),
+                                       "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
+                                       "Account": st.column_config.TextColumn(disabled=True),
+                                       "Category now": st.column_config.TextColumn(disabled=True),
+                                       "Assign to": st.column_config.SelectboxColumn(options=[KEEP] + budget_lines, help="A line from your budget sheet"),
+                                       "Only this charge": st.column_config.CheckboxColumn(help="Tick for a one-off. Otherwise it's remembered for the merchant.")})
+    html('<p class="lg-note" style="margin:6px 0">Assignments are remembered for the merchant from this month on and for future statements; '
+         'earlier months keep what they had. Tick <b>Only this charge</b> for a one-off.</p>')
+    if st.button("Save assignments", type="primary", key="nib-save"):
+        byid = {t["id"]: t for t in L.txns}
+        learn, changes = {}, {}
+        for i, (_, r) in enumerate(ed.iterrows()):
+            if r["Assign to"] in (None, "", KEEP):
                 continue
-            add(self.section_of(c), pay, t["spend"])
-        budget: dict[str, float] = {}
-        asides, aside_tot = self.asides_for(m), 0.0
-        for c, v in self.plan_for(m).items():
-            if self.is_excluded(c):
+            t = byid[ids[i]]
+            if bool(r.get("Only this charge")):
+                changes[t["id"]] = {"cat_override": r["Assign to"]}
+            else:
+                learn.setdefault(learn_key(t["desc"]), {}).update(line=r["Assign to"], project=DROP)
+                if t.get("cat_override"):
+                    changes[t["id"]] = {"cat_override": None}
+        if changes:
+            update_txns(changes)
+        start = m if (m and scope != "All months") else (min(L.months()) if L.months() else "0000-00")
+        n = remember_choices(learn, start) if learn else 0
+        if learn or changes:
+            st.session_state["nib-flash"] = (f"Assigned and remembered for {len(learn)} merchant{'s' if len(learn) != 1 else ''}; future statements will follow it."
+                                             if learn else f"Assigned {len(changes)} charge{'s' if len(changes) != 1 else ''}.")
+            st.rerun()
+    if st.session_state.get("nib-flash"):
+        st.success(st.session_state.pop("nib-flash"))
+
+
+def page_big(L: Ledger, m: str | None = None):
+    html('<div class="lg-h2" style="margin-top:4px">Extras II fund</div><p class="lg-note" style="margin:0 0 10px">Each month the fund gets that month&#39;s '
+         'Extras II budget, plus whatever was left on Core and Extras I once the month is closed. Everyday Extras II spending and big expenses '
+         'come out of it. Unspent money stays in the fund; a negative balance is paid back by future months.</p>')
+    html(ui.fund_panel(L, m))
+    if m:
+        close_month_toggle(L, m, f"close-big-{m}")
+    with st.expander("Fund settings: start, top-ups, closed months"):
+        fs = L.fund_settings()
+        c1, c2 = st.columns(2)
+        start = c1.text_input("Fund starts (YYYY-MM)", value=fs["start"], key="f-start")
+        opening = c2.number_input("Balance at the start", value=float(fs["opening"] or 0), step=50.0, key="f-open")
+        st.markdown("**Top-ups** (money put into the fund from outside the monthly budget, e.g. Aneeq's Roth). Leave Month blank for planned ones; they count in the outlook only.")
+        tdf = pd.DataFrame([{"Month": t.get("month") or "", "Whose money": {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}.get(t.get("who"), ""),
+                             "Amount": float(t.get("amount") or 0), "Note": t.get("note", "")} for t in fs["topups"]],
+                           columns=["Month", "Whose money", "Amount", "Note"])
+        ted = st.data_editor(tdf, hide_index=True, width="stretch", num_rows="dynamic", key="f-tops",
+                             column_config={"Month": st.column_config.TextColumn(help="YYYY-MM, or blank if not yet received"),
+                                            "Whose money": st.column_config.SelectboxColumn(options=["🟣 Zuha", "🔵 Aneeq"]),
+                                            "Amount": st.column_config.NumberColumn(format="$%.2f")})
+        closed = st.multiselect("Closed months (all statements in)", L.months(), default=[x for x in fs["closed"] if x in L.months()],
+                                format_func=month_label, key="f-closed")
+        if st.button("Save fund settings", type="primary", key="f-save"):
+            import re as _re
+            if not _re.fullmatch(r"\d{4}-\d{2}", start.strip()):
+                st.error("Start month must look like 2026-09.")
+            else:
+                save_config("fund", {"start": start.strip(), "opening": float(opening or 0), "closed": sorted(closed),
+                                     "topups": [{"month": str(r["Month"] or "").strip(), "who": {"🟣 Zuha": "zuha", "🔵 Aneeq": "aneeq"}.get(r["Whose money"]),
+                                                 "amount": float(r["Amount"] or 0), "note": str(r["Note"] or "")}
+                                                for _, r in ted.iterrows() if float(r["Amount"] or 0)]})
+                st.success("Saved.")
+                st.rerun()
+
+    html('<div class="lg-h2">Big expenses</div><p class="lg-note" style="margin:0 0 12px">Paid from the Extras II fund and split 50:50 unless you change it. '
+         'Tag a charge to one from Transactions by choosing ★ in the Line column.</p>')
+    for p in L.projects:
+        stt = L.proj_stats(p)
+        html(ui.big_card(L, p))
+        with st.expander(f"Edit {p['name']}"):
+
+            items = pd.DataFrame([{"Item": i["name"], "Whose": WHO_NAME.get(i.get("who"), "") if i.get("who") else "",
+                                   "Estimated": float(i.get("est") or 0), "Spent so far": stt["by_item"].get(i["name"], 0.0)}
+                                  for i in p.get("items") or []], columns=["Item", "Whose", "Estimated", "Spent so far"])
+            ed = st.data_editor(items[["Item", "Whose", "Estimated"]], hide_index=True, width="stretch", num_rows="dynamic", key=f"items-{p['id']}",
+                                column_config={"Whose": st.column_config.SelectboxColumn(options=WHO_OPTS, help="Blank = project split"),
+                                               "Estimated": st.column_config.NumberColumn(format="$%.0f")})
+
+            c1, c2, c3 = st.columns(3)
+            split_opts = {"50:50": "even", "Custom": "custom", "All Zuha": "zuha", "All Aneeq": "aneeq"}
+            cur_split = p.get("split") if p.get("split") in split_opts.values() else "even"
+            split = c1.selectbox("Split", list(split_opts), index=list(split_opts.values()).index(cur_split), key=f"split-{p['id']}")
+            zpct = c3.number_input("Zuha's share %", min_value=0, max_value=100, value=int(float(p.get("zuha_pct") or 50)),
+                                   key=f"zpct-{p['id']}", disabled=split_opts[split] != "custom")
+            sec_names = [l for _, l in SECTIONS]
+            cur = next((l for k, l in SECTIONS if k == (p.get("section") or DEFAULT_SECTION)), "Extras II")
+            sec = c2.selectbox("Counts under", sec_names, index=sec_names.index(cur), key=f"sec-{p['id']}")
+            if st.button("Save changes", key=f"save-{p['id']}", type="primary"):
+                projects = fresh()[1].projects
+                tgt = next(x for x in projects if x["id"] == p["id"])
+                tgt["items"] = [{"name": str(r["Item"]), "est": float(r["Estimated"] or 0),
+                                 **({"who": WHO_KEY[r["Whose"]]} if r.get("Whose") else {})}
+                                for _, r in ed.iterrows() if str(r["Item"] or "").strip()]
+                tgt["split"] = split_opts[split]
+                if split_opts[split] == "custom":
+                    tgt["zuha_pct"] = int(zpct)
+                else:
+                    tgt.pop("zuha_pct", None)
+                tgt["section"] = next(k for k, l in SECTIONS if l == sec)
+                save_config("projects", projects)
+                st.success("Saved.")
+                st.rerun()
+
+    with st.form("new-project", clear_on_submit=True):
+        name = st.text_input("New big expense")
+        if st.form_submit_button("Add big expense") and name.strip():
+            projects = fresh()[1].projects
+            pid = "-".join(w for w in "".join(ch.lower() if ch.isalnum() else " " for ch in name).split()) or "big"
+            while any(x["id"] == pid for x in projects):
+                pid += "-2"
+            projects.append({"id": pid, "name": name.strip(), "items": [], "funding": []})
+            save_config("projects", projects)
+            st.rerun()
+
+
+def page_settle(L: Ledger, m: str | None = None):
+    html(ui.settle(L, m))
+
+
+# ---------------------------------------------------------------- bank sync (SimpleFIN)
+def feed_urls() -> list[str]:
+    sec = secret("simplefin")
+    urls = sec.get("access_urls") or ([sec["access_url"]] if sec.get("access_url") else [])
+    return [str(u) for u in urls if u]
+
+
+def run_sync(person: str) -> tuple[str, list[str]]:
+    """Pull recent transactions from every connected bank and add the ones not already in the ledger."""
+    store = get_store()
+    d, LL = fresh()
+    sync = d["config"].get("sync") or {}
+    start, end = bankfeed.window(sync.get("last"), time.time())
+    rows, errs = [], []
+    for u in feed_urls():
+        try:
+            data = bankfeed.fetch(u, start, end)
+        except bankfeed.FeedError as e:
+            errs.append(str(e))
+            continue
+        except Exception as e:  # noqa: BLE001 — network trouble: report it, keep going
+            errs.append(f"Couldn't reach SimpleFIN ({type(e).__name__}). Try again later.")
+            continue
+        errs += bankfeed.messages(data)
+        rows += bankfeed.to_rows(data, LL.accounts())
+    new, dup = LL.add_parsed(rows, "bank-sync", person)
+    # Charges you categorized by hand before (one at a time) keep that line when they come in from the bank.
+    prior: dict[str, str] = {}
+    for t in sorted(LL.txns, key=lambda t: t["date"]):
+        if t.get("cat_override"):
+            prior[learn_key(t["desc"])] = t["cat_override"]
+    for t in new:
+        k = learn_key(t["desc"])
+        if k in prior and not LL.learned(t).get("line"):
+            t["cat_override"] = prior[k]
+    # Categorize only what the household's own rules don't already cover.
+    unknown = [t for t in new if t["category"] == "Uncategorized" and LL.cat_of(t) == "Uncategorized" and not LL.contrib_of(t)]
+    key, model = secret("anthropic").get("api_key"), secret("anthropic").get("model", "claude-sonnet-5-5")
+    if unknown and key:
+        try:
+            from ledger.parse import categorize
+            done = categorize([{"desc": t["desc"], "amt": t["spend"], "account": t["account"], "category": t["category"]} for t in unknown],
+                              LL, key, model)
+            for t, r in zip(unknown, done):
+                t["category"] = r["category"]
+        except Exception:  # noqa: BLE001 — leave them for the Not in budget tab
+            errs.append("Claude couldn't categorize some new charges; they're on the Not in budget tab.")
+    # New accounts: Chase is Zuha's, Wells Fargo is Aneeq's.
+    rules, changed = LL.rules, False
+    for a in {t["account"] for t in new}:
+        if not rules["payer"].get(a):
+            who = "zuha" if "chase" in a.lower() else "aneeq" if "wells" in a.lower() else None
+            if who:
+                rules["payer"][a] = who
+                changed = True
+    if new:
+        store.save_txns(d["txns"] + new)
+    if changed:
+        store.save_config("rules", rules)
+    store.save_config("sync", {"last": end, "at": now_iso(), "by": person, "added": len(new), "skipped": dup, "errors": errs[:10]})
+    bump()
+    msg = f"Bank sync added {len(new)} new transaction{'s' if len(new) != 1 else ''}" + (f" ({dup} already in the ledger)" if dup else "") + "."
+    return msg, errs
+
+
+def bank_sync_panel(d: dict, person: str):
+    urls = feed_urls()
+    sync = d["config"].get("sync") or {}
+    html('<div class="lg-h2" style="margin-top:4px">Bank sync</div>')
+    if urls:
+        last = sync.get("at")
+        info = (f"Last synced {str(last)[:16].replace('T', ' ')} by {PEOPLE.get(sync.get('by'), sync.get('by', ''))}: "
+                f"{sync.get('added', 0)} new, {sync.get('skipped', 0)} already here." if last else "Not synced yet.")
+        html(f'<p class="lg-note" style="margin:0 0 8px">{ui.e(info)} The app also syncs by itself when someone opens it '
+             'and the last sync is more than 20 hours old. Banks update once a day.</p>')
+        for e_ in sync.get("errors") or []:
+            st.warning(e_)
+        recent = sync.get("last") and time.time() - float(sync["last"]) < 15 * 60
+        if st.button("Sync banks now", type="primary", key="sync-now", disabled=bool(recent),
+                     help="Available again 15 minutes after the last sync" if recent else None):
+            with st.spinner("Getting new transactions from your banks…"):
+                msg, errs = run_sync(person)
+            st.session_state["st-flash"] = msg
+            st.rerun()
+    else:
+        html('<p class="lg-note" style="margin:0 0 8px">Connect Chase and Wells Fargo through SimpleFIN Bridge so new '
+             'transactions come in automatically. PDF uploads below keep working either way.</p>')
+    with st.expander("Connect banks" if not urls else "Connect another SimpleFIN account"):
+        st.markdown("1. In SimpleFIN Bridge, link your banks, then under **Apps** create a new connection and copy the **setup token**.\n"
+                    "2. Paste it here and press **Connect**. Each token works once.")
+        tok = st.text_input("Setup token", type="password", key="sfin-token")
+        if st.button("Connect", key="sfin-connect") and tok.strip():
+            try:
+                access = bankfeed.claim(tok)
+            except bankfeed.FeedError as e:
+                st.error(str(e))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Couldn't reach SimpleFIN ({type(e).__name__}). Try again.")
+            else:
+                all_urls = urls + [access]
+                block = ("[simplefin]\n" + (f'access_url = "{access}"' if len(all_urls) == 1
+                                             else "access_urls = [\n" + ",\n".join(f'  "{u}"' for u in all_urls) + "\n]"))
+                st.success("Connected. Last step: save this in the app's secrets (⋮ → Settings → Secrets), "
+                           "replacing any existing [simplefin] section, then reboot the app. Keep it private: it reads your bank transactions.")
+                st.code(block, language="toml")
+
+
+def page_statements(L: Ledger, d: dict, person: str):
+    bank_sync_panel(d, person)
+    html('<div class="lg-h2">Statements</div>')
+    api_key = secret("anthropic").get("api_key")
+    model = secret("anthropic").get("model", "claude-sonnet-5-5")
+    html('<p class="lg-note" style="margin:0 0 10px">Upload PDF statements from Chase, Wells Fargo or any other card. '
+         'Claude reads each one; you check the totals and pick whose account it is, then add it to the ledger. '
+         'The original PDF is saved to the shared Drive folder.</p>')
+    files = st.file_uploader("Bank or card statement PDFs", type=["pdf"], accept_multiple_files=True, key="uploader")
+    saved = d.get("statements") or []
+    by_hash = {s_.get("file_hash"): s_ for s_ in saved if s_.get("file_hash")}
+    if files and st.button("Read statements", type="primary", disabled=not api_key):
+        from ledger.parse import read_statement
+        pend = st.session_state.setdefault("pending", {})
+        pend_hashes = {p_.get("hash") for p_ in pend.values()}
+        for f in files:
+            pdf = f.getvalue()
+            h = hashlib.sha256(pdf).hexdigest()
+            if h in by_hash:  # exact same file: don't send it to Claude again
+                s_ = by_hash[h]
+                st.info(f"{f.name} was already added on {str(s_.get('uploaded_at', ''))[:10]} by "
+                        f"{PEOPLE.get(s_.get('uploaded_by'), s_.get('uploaded_by', ''))} ({s_.get('account', '')}, "
+                        f"{s_.get('period_start', '')} to {s_.get('period_end', '')}), so it wasn't read again.")
                 continue
-            a = sum(x["amt"] for x in asides.get(c, []))
-            aside_tot += a
-            key = self.section_of(c)
-            budget[key] = budget.get(key, 0) + max(0.0, float(v or 0) - a)
-        return {"rows": rows, "budget": budget, "aside_tot": aside_tot}
-
-    def person_budget(self, m: str, who: str) -> dict:
-        """One person's budget check for a month: their lines plus half of shared lines (net of money set aside
-        for big expenses) against the spending that counts toward them. Big expenses are left out (paid from the
-        set-asides); spending they own that isn't on a budget line is included as unbudgeted."""
-        res = self.compute(m)
-        plan, asides = self.plan_for(m), self.asides_for(m)
-        rows, cats = [], {r["cat"]: r for r in res["cats"]}
-        for c in sorted(set(plan) | set(cats)):
-            if self.is_excluded(c) or self.plan["groups"].get(c) == DEFAULT_SECTION:
+            if h in pend_hashes:
+                st.info(f"{f.name} is already waiting below to be added.")
                 continue
-            owner = self.rules["category"].get(c)
-            share = 1.0 if owner == who else 0.5 if owner == "shared" else 0.0
-            avail = max(0.0, float(plan.get(c) or 0) - sum(a["amt"] for a in asides.get(c, [])))
-            r = cats.get(c)
-            spent = (r[who] + r["shared"] / 2) if r else 0.0
-            budget = avail * share
-            if budget or abs(spent) >= .5:
-                rows.append({"line": c, "owner": owner, "share": share, "budget": budget, "spent": spent,
-                             "on_plan": c in plan, "section": self.plan["groups"].get(c) or ("Other budget lines" if c in plan else "Not in the budget")})
-        budget = sum(r["budget"] for r in rows)
-        spent = sum(r["spent"] for r in rows)
-        return {"rows": rows, "budget": budget, "spent": spent, "left": budget - spent,
-                "unassigned": res["tot"]["none"], "paid_by_them": res["paid"].get(who, 0.0)}
+            with st.spinner(f"Reading {f.name}… this usually takes under a minute"):
+                try:
+                    pend[f.name] = {"pdf": pdf, "hash": h, "res": read_statement(pdf, L, api_key, model), "name": f.name}
+                    pend_hashes.add(h)
+                except Exception as e:  # noqa: BLE001 — show the reason and keep going with the others
+                    st.error(f"{f.name}: {e}")
+    if not api_key:
+        st.warning("Add an Anthropic API key under [anthropic] in the app's secrets to read statements.")
 
-    SETTLE_ORDER = [("carried", "Owed from earlier months"), ("Home Budget", "Core budget"), ("Extras I", "Extras I"),
-                    (DEFAULT_SECTION, "Extras II and big expenses"), ("other", "Other (not on a budget line)"),
-                    ("sent", "Money Zuha sent him")]
+    for name, p in list(st.session_state.get("pending", {}).items()):
+        res = p["res"]
+        rows = res["rows"]
+        out = sum(r["amt"] for r in rows if r["amt"] > 0)
+        back = -sum(r["amt"] for r in rows if r["amt"] < 0)
+        with st.container(border=True):
+            st.markdown(f"**{res['account']}** · {res.get('start') or '?'} to {res.get('end') or '?'} · {len(rows)} transactions · `{name}`")
+            tot = res.get("totals") or {}
 
-    def settle_rows(self) -> list[dict]:
-        """Aneeq's dues to Zuha, month by month, and where his payments went. No tagging needed.
-        Dues per section: his lines, his half of shared lines and his share of big expenses that Zuha paid, less
-        Zuha's share of anything he paid. Money Zuha sends him is also due.
-        Money he sends pays, in order: anything owed from earlier months, Core, Extras I, Extras II (incl. big
-        expenses), other, money Zuha sent him. What's left goes to more of that month's Extras II and big expenses
-        (he simply paid more than half of them; x2_pct says how much), up to all of what Zuha paid there. Only what's
-        left after that is credit for next month.
-        If he paid for more of Zuha's share than she did of his (his extra spending), that covers his other dues
-        first; any of it left over is absorbed, since Zuha never owes him.
-        running > 0: he owes Zuha. running < 0: he has credit."""
-        bal, out = 0.0, []
-        for m in self.months():
-            s = self.compute(m)["settle"]
-            by = dict(s["by"])
-            dues = {"carried": max(0.0, bal), **{k: max(0.0, v) for k, v in by.items()}, "sent": s["zuha_to_aneeq"]}
-            spend_extra = sum(-v for v in by.values() if v < 0)       # his extra spending, by section
-            cash = s["aneeq_to_zuha"] + max(0.0, -bal)                 # money he sent + credit carried in
-            alloc = []
-            for key, label in self.SETTLE_ORDER:
-                due = dues.get(key, 0.0)
-                from_spend = min(due, spend_extra) if key != "carried" else 0.0   # his own extra spending can't pay old balances
-                spend_extra -= from_spend
-                from_cash = min(due - from_spend, cash)
-                cash -= from_cash
-                alloc.append({"key": key, "label": label, "due": due, "covered_by_spending": from_spend,
-                              "paid": from_cash, "unpaid": due - from_spend - from_cash})
-            x2a = next(a for a in alloc if a["key"] == DEFAULT_SECTION)
-            total = s["x2_total"]
-            his_x2 = s["x2_aneeq"] + min(0.0, by[DEFAULT_SECTION]) + (x2a["due"] - x2a["unpaid"])   # what he's covered of Extras II
-            extra_x2 = min(cash, max(0.0, total - his_x2)) if total > 0 else 0.0
-            cash -= extra_x2
-            his_x2 += extra_x2
-            x2_pct = his_x2 / total if total > 0 else None
-            unpaid = sum(a["unpaid"] for a in alloc)
-            start = bal
-            bal = unpaid if unpaid > 0.005 else (-cash if cash > 0.005 else 0.0)
-            due_month = sum(max(0.0, v) for v in by.values()) + s["zuha_to_aneeq"]
-            out.append({"month": m, "gross": s["net"] + s["aneeq_to_zuha"] - s["zuha_to_aneeq"],
-                        "he_sent": s["aneeq_to_zuha"], "you_sent": s["zuha_to_aneeq"],
-                        "due": max(0.0, s["net"] + s["aneeq_to_zuha"]), "due_by_section": due_month,
-                        "net": bal - start, "absorbed": spend_extra, "start": start, "running": bal,
-                        "x2_total": total, "x2_his": his_x2, "x2_extra": extra_x2, "x2_pct": x2_pct,
-                        "alloc": alloc, "skipped": s["skipped"]})
-        return out
+            def chk(mine, theirs, label):
+                if isinstance(theirs, (int, float)) and theirs > 0:
+                    return (f":green[✓ {label} {money(mine, True)} matches the statement]" if abs(mine - theirs) < .01
+                            else f":orange[{label} {money(mine, True)} vs {money(theirs, True)} on the statement]")
+                return f"{label} {money(mine, True)}"
+            st.markdown(chk(out, tot.get("purchases"), "Money out") + " · " + chk(back, tot.get("credits"), "Payments & credits"))
+            preview_new, preview_dup = L.add_parsed(rows, "preview", person)
+            same_period = [s_ for s_ in saved if s_.get("account") == res["account"] and res.get("start") and res.get("end")
+                           and s_.get("period_start") == res.get("start") and s_.get("period_end") == res.get("end")]
+            if same_period:
+                st.warning(f"This looks like a statement already added on {str(same_period[0].get('uploaded_at', ''))[:10]} "
+                           f"(same account and dates). Only charges not already in the ledger will be added.")
+            if not preview_new:
+                st.markdown(f":green[All {len(rows)} transactions are already in the ledger. Nothing new to add.]")
+            elif preview_dup:
+                st.markdown(f"**{len(preview_new)} new** transactions will be added; {preview_dup} already in the ledger will be skipped.")
+            else:
+                st.markdown(f"**{len(preview_new)} new** transactions will be added.")
+            cur = L.rules["payer"].get(res["account"])
+            labels = list(PAYER_OPTS)
+            idx = next((i for i, (k, v) in enumerate(PAYER_OPTS.items()) if v == cur), 0)
+            payer = st.selectbox("Whose account is this?", labels, index=idx, key=f"payer-{name}")
+            c1, c2 = st.columns([1, 4])
+            if c1.button("Add to ledger", key=f"add-{name}", type="primary", disabled=not PAYER_OPTS[payer] or not preview_new):
+                store = get_store()
+                dd, LL = fresh()
+                sid = uuid.uuid4().hex[:12]
+                new, dup = LL.add_parsed(rows, sid, person)
+                meta = store.add_statement({"id": sid, "filename": name, "account": res["account"],
+                                            "period_start": res.get("start") or "", "period_end": res.get("end") or "",
+                                            "uploaded_by": person, "uploaded_at": now_iso(), "n_added": len(new),
+                                            "n_skipped": dup, "file_hash": p.get("hash", "")}, p["pdf"])
+                store.save_txns(dd["txns"] + new)
+                if LL.rules["payer"].get(res["account"]) != PAYER_OPTS[payer]:
+                    LL.rules["payer"][res["account"]] = PAYER_OPTS[payer]
+                    store.save_config("rules", LL.rules)
+                st.session_state["pending"].pop(name, None)
+                bump()
+                st.session_state["st-flash"] = (f"Added {len(new)} transactions" + (f", skipped {dup} already in the ledger" if dup else "")
+                                                + f" from {meta['filename']}.")
+                st.rerun()
+            if c2.button("Discard", key=f"drop-{name}"):
+                st.session_state["pending"].pop(name, None)
+                st.rerun()
 
-    def owed_through(self, m: str) -> tuple[float, float]:
-        """(Aneeq's balance after month m: + owes Zuha, − credit; change during month m)."""
-        prev, cur = 0.0, 0.0
-        for r in self.settle_rows():
-            if r["month"] > m:
-                break
-            prev, cur = cur, r["running"]
-        return cur, cur - prev
+    if st.session_state.get("st-flash"):
+        st.success(st.session_state.pop("st-flash"))
+    sts = sorted(d.get("statements") or [], key=lambda s: s.get("uploaded_at", ""), reverse=True)
+    if sts:
+        st.markdown("**Saved statements**")
+        for s in sts:
+            c1, c2 = st.columns([5, 1])
+            c1.markdown(f"{s.get('account','')} · {s.get('period_start','')} to {s.get('period_end','')} · "
+                        f"{s.get('n_added','?')} added · uploaded by {PEOPLE.get(s.get('uploaded_by'), s.get('uploaded_by',''))} "
+                        f"on {str(s.get('uploaded_at',''))[:10]} · `{s.get('filename','')}`")
+            key = f"pdf-{s['id']}"
+            if c2.button("Get PDF", key=f"get-{s['id']}"):
+                st.session_state[key] = get_store().get_pdf(s)
+            if st.session_state.get(key):
+                c2.download_button("Download", st.session_state[key], file_name=s.get("filename") or "statement.pdf",
+                                   mime="application/pdf", key=f"dl-{s['id']}")
 
-    def proj_settle(self, p: dict) -> dict:
-        """Aneeq's side of one big expense: his share of its charges and what he paid on his own cards."""
-        share = direct = 0.0
-        for t in self.proj_stats(p)["txns"]:
-            zp = self.tx_z_share(t, p)
-            share += (1 - zp) * t["spend"]
-            pay = self.payer_of(t)
-            direct += t["spend"] if pay == "aneeq" else t["spend"] / 2 if pay == "shared" else 0.0
-        sent = sum(abs(t["spend"]) for t in self.txns
-                   if (self.proj_of(t) or {}).get("id") == p["id"] and (self.contrib_of(t) or {}).get("from") == "aneeq")
-        return {"share": share, "direct": direct, "sent": sent, "left": share - direct - sent}
 
-    # ---------- Extras II fund ----------
-    def fund_settings(self) -> dict:
-        f = dict(self.fund_cfg or {})
-        f.setdefault("start", "2026-09")
-        f.setdefault("opening", 0.0)
-        f.setdefault("closed", [])
-        if "topups" not in f:  # from the budget sheet: Aneeq's Roth money for big expenses (no date yet = planned)
-            f["topups"] = [{"month": "", "who": x.get("owner"), "amount": self.fund_amt(x), "note": f"{x.get('label', '')} for {p['name']}"}
-                           for p in self.projects for x in p.get("funding") or [] if not x.get("line") and x.get("owner")]
-        return f
+def page_rules(L: Ledger, d: dict):
+    html('<div class="lg-h2" style="margin-top:4px">Rules</div>')
+    rules = L.rules
+    st.caption("Colours: 🟣 Zuha · 🔵 Aneeq · 🟡 Shared. A charge's person comes from the first match: a one-off choice, "
+               "a remembered merchant, an older merchant rule, an account rule, then the line's owner.")
 
-    def _next(self, m: str) -> str:
-        y, mo = int(m[:4]), int(m[5:7]) + 1
-        return f"{y + (mo > 12)}-{(mo - 1) % 12 + 1:02d}"
+    st.markdown("**Accounts**")
+    accts = sorted(set(L.accounts()) | set(rules["payer"]))
+    inv = {v: k for k, v in PAYER_OPTS.items()}
+    adf = pd.DataFrame([{"Account": a, "Paid by": inv.get(rules["payer"].get(a), "")} for a in accts], columns=["Account", "Paid by"])
+    aed = st.data_editor(adf, hide_index=True, width="stretch", key="r-acct",
+                         column_config={"Account": st.column_config.TextColumn(disabled=True),
+                                        "Paid by": st.column_config.SelectboxColumn(options=list(PAYER_OPTS))})
 
-    def fund_month(self, m: str) -> dict:
-        """One month of the Extras II fund."""
-        fs = self.fund_settings()
-        plan = self.plan_for(m)
-        x2 = sum(float(v or 0) for c, v in plan.items() if self.plan["groups"].get(c) == DEFAULT_SECTION and not self.is_excluded(c))
-        res = self.compute(m) if m in self.months() else {"cats": []}
-        cats = {r["cat"]: r for r in res["cats"]}
-        lines = {c for c in plan if self.plan["groups"].get(c) in ("Home Budget", "Extras I")} | \
-                {c for c in cats if self.plan["groups"].get(c) in ("Home Budget", "Extras I")}
-        leftover = sum(float(plan.get(c) or 0) - (cats[c]["all"] if c in cats else 0.0) for c in lines if not self.is_excluded(c))
-        sm = self.section_matrix(m)["rows"] if m in self.months() else {}
-        regular = sum(sm.get(DEFAULT_SECTION, {}).values())
-        big = sum(v for k, r in sm.items() if k.startswith("big:") for v in r.values())
-        by_proj = {p["name"]: sum(sm.get("proj:" + p["id"], {}).values()) for p in self.projects if sm.get("proj:" + p["id"])}
-        tops = [t for t in fs["topups"] if str(t.get("month") or "") == m]
-        closed = m in fs["closed"]
-        lo = max(0.0, leftover) if closed else 0.0
-        return {"month": m, "x2": x2, "leftover_raw": leftover, "leftover": lo, "closed": closed,
-                "topups": sum(float(t.get("amount") or 0) for t in tops), "regular": regular, "big": big, "by_proj": by_proj,
-                "net": x2 + lo + sum(float(t.get("amount") or 0) for t in tops) - regular - big}
+    st.markdown("**Money between you** (incoming or outgoing transfers whose description contains this text)")
+    cdf = pd.DataFrame([{"Description contains": c["match"], "From": PEOPLE[c["from"]]} for c in rules["contrib"]],
+                       columns=["Description contains", "From"])
+    ced = st.data_editor(cdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-contrib",
+                         column_config={"From": st.column_config.SelectboxColumn(options=["Aneeq", "Zuha"])})
 
-    def fund(self, through: str | None = None) -> dict:
-        fs = self.fund_settings()
-        last = max(self.months() + [fs["start"]]) if through is None else through
-        m, bal, rows = fs["start"], float(fs["opening"] or 0), []
-        while m <= last and len(rows) < 120:
-            r = self.fund_month(m)
-            bal += r["net"]
-            r["balance"] = bal
-            rows.append(r)
-            m = self._next(m)
-        # Projection: the standard monthly Extras II budget less the recent everyday Extras II spending,
-        # then the rest of every planned big expense and any undated top-ups.
-        std = sum(float(v or 0) for c, v in self.plan["budgets"].items() if self.plan["groups"].get(c) == DEFAULT_SECTION)
-        std_lines = {c for c in self.plan["budgets"] if self.plan["groups"].get(c) == DEFAULT_SECTION}
-        recent = [sum(x["all"] for x in self.compute(r["month"])["cats"] if x["cat"] in std_lines)
-                  for r in rows if r["month"] in self.months()][-3:]
-        everyday = sum(recent) / len(recent) if recent else 0.0
-        per_month = std - everyday
-        planned = {p["name"]: max(0.0, self.proj_stats(p)["est"] - self.proj_stats(p)["spent"]) for p in self.projects}
-        planned = {k: v for k, v in planned.items() if v >= 1}
-        undated = sum(float(t.get("amount") or 0) for t in fs["topups"] if not t.get("month"))
-        low = bal - sum(planned.values()) + undated
-        months_to_zero = None
-        if low < 0 and per_month > 0:
-            import math
-            months_to_zero = math.ceil(-low / per_month)
-        return {"rows": rows, "balance": bal, "std": std, "everyday": everyday, "per_month": per_month,
-                "planned": planned, "undated_topups": undated, "low": low, "months_to_zero": months_to_zero,
-                "pending": [r for r in rows if not r["closed"] and r["month"] in self.months()]}
+    lines = L.budget_lines()
+    st.markdown("**Remembered merchants** (set from the Transactions or Not in budget tab; these win over every other rule). "
+                "Removing one here forgets it for every month; to stop it only from a month on, set its Line to — on Transactions.")
+    lrn = rules.get("learn") or {}
+    lrdf = pd.DataFrame([{"Merchant": k, "Line": v.get("line", "") or ("★ " + pn) if (pn := {p["id"]: p["name"] for p in L.projects}.get(v.get("project"))) else v.get("line", ""),
+                          "Who": WHO_NAME.get(v.get("who"), "")} for k, v in sorted(lrn.items())],
+                        columns=["Merchant", "Line", "Who"])
+    lred = st.data_editor(lrdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-learn",
+                          column_config={"Merchant": st.column_config.TextColumn(disabled=False),
+                                         "Line": st.column_config.SelectboxColumn(options=[""] + L.all_categories() + ["★ " + p["name"] for p in L.projects]),
+                                         "Who": st.column_config.SelectboxColumn(options=WHO_OPTS)})
 
-    # ---------- importing ----------
-    def add_parsed(self, rows: list[dict], statement_id: str, added_by: str, tolerance_days: int = 3) -> tuple[list[dict], int]:
-        """Dedupe incoming rows (from a PDF statement or the bank feed) against what's stored.
-        Same source: an exact match (bank-feed id, or same day/account/amount for statements).
-        Across sources (statement vs bank feed): same account and amount within a few days, because a bank
-        feed and a statement can date the same charge a day or two apart. Returns (new transactions, duplicates)."""
-        import datetime as _dt
-        day = lambda d: _dt.date.fromisoformat(d).toordinal()
-        seen: dict[str, int] = {}
-        used: set[str] = set()
-        new, dup = [], 0
-        existing = self.txns
-        for r in rows:
-            base = "|".join([r["date"], r["desc"], f"{r['amt']:.2f}", r["account"]])
-            seen[base] = seen.get(base, 0) + 1
-            tid = fnv_id(base + "|" + str(seen[base]))
-            spend = round(r["amt"], 2)
-            ext = r.get("ext_id")
-            rd = day(r["date"])
+    st.markdown("**Always counts toward a big expense** (descriptions matching this go to the big expense, even payments to PayPal)")
+    pnames = {p["id"]: p["name"] for p in L.projects}
+    prdf = pd.DataFrame([{"Description matches": x["match"], "Big expense": pnames.get(x["project"], "")} for x in L.proj_rules()],
+                        columns=["Description matches", "Big expense"])
+    pred = st.data_editor(prdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-proj",
+                          column_config={"Description matches": st.column_config.TextColumn(help="Words from the description, e.g. wayfair; use | between alternatives"),
+                                         "Big expense": st.column_config.SelectboxColumn(options=list(pnames.values()))})
 
-            def same(t, pool_is_existing):
-                if t["id"] in used:
-                    return False
-                if ext and t.get("ext_id"):
-                    return t["ext_id"] == ext
-                if t["account"] != r["account"] or abs(t["spend"] - spend) >= 0.005:
-                    return t["id"] == tid
-                if bool(ext) != bool(t.get("ext_id")):  # one from the feed, one from a statement
-                    return pool_is_existing and abs(day(t["date"]) - rd) <= tolerance_days
-                return t["date"] == r["date"] or t["id"] == tid
+    st.markdown("**Billed for next month** (charges from these merchants on or after the given day count in the following month)")
+    sdf = pd.DataFrame([{"Merchant contains": x["match"], "From day": int(x.get("from_day") or 20)} for x in L.shift_rules()],
+                       columns=["Merchant contains", "From day"])
+    shed = st.data_editor(sdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-shift",
+                          column_config={"Merchant contains": st.column_config.TextColumn(help="Lowercase words from the merchant name, e.g. ota scuba swim"),
+                                         "From day": st.column_config.NumberColumn(min_value=1, max_value=31, step=1)})
 
-            twin = next((t for t in existing if same(t, True)), None) or next((t for t in new if same(t, False)), None)
-            if twin:
-                used.add(twin["id"])
-                dup += 1
+    st.markdown("**Taken from pay** (counted as spent every month without a statement, e.g. insurance deducted from a paycheck)")
+    ddf = pd.DataFrame([{"Line": x["line"], "Whose pay": PEOPLE.get(x.get("who") or "zuha"), "Amount": float(x["amount"]) if x.get("amount") else None}
+                        for x in L.deductions()], columns=["Line", "Whose pay", "Amount"])
+    ded = st.data_editor(ddf, hide_index=True, width="stretch", num_rows="dynamic", key="r-ded",
+                         column_config={"Line": st.column_config.SelectboxColumn(options=L.budget_lines()),
+                                        "Whose pay": st.column_config.SelectboxColumn(options=["Zuha", "Aneeq"]),
+                                        "Amount": st.column_config.NumberColumn(format="$%.2f", help="Blank = that month's budget for the line")})
+
+    st.markdown("**Store rules** (any charge naming the store goes to the line)")
+    pdf = pd.DataFrame([{"Store": r.get("label") or r["match"], "Matches": r["match"], "Except": r.get("not", ""), "Line": r["cat"]}
+                        for r in rules["patcat"]], columns=["Store", "Matches", "Except", "Line"])
+    ped = st.data_editor(pdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-pat",
+                         column_config={"Line": st.column_config.SelectboxColumn(options=lines),
+                                        "Matches": st.column_config.TextColumn(help="Lowercase word(s), e.g. costco or (walmart|wm supercenter)"),
+                                        "Except": st.column_config.TextColumn(help="e.g. costco gas")})
+
+    st.markdown("**Merchant rules**")
+    mks = sorted(set(rules["merchant"]) | set(rules["recat"]))
+    mdf = pd.DataFrame([{"Merchant": k, "Line": rules["recat"].get(k, ""), "Counts toward": WHO_NAME.get(rules["merchant"].get(k), "") if rules["merchant"].get(k) else ""}
+                        for k in mks], columns=["Merchant", "Line", "Counts toward"])
+    med = st.data_editor(mdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-merch",
+                         column_config={"Line": st.column_config.SelectboxColumn(options=[""] + L.all_categories()),
+                                        "Counts toward": st.column_config.SelectboxColumn(options=WHO_OPTS)})
+
+    st.markdown("**Budget lines**")
+    ldf = pd.DataFrame([{"Line": c, "Whose": WHO_NAME.get(rules["category"].get(c), "") if rules["category"].get(c) else "",
+                         "Counted as spending": not L.is_excluded(c)} for c in L.all_categories()],
+                       columns=["Line", "Whose", "Counted as spending"])
+    led = st.data_editor(ldf, hide_index=True, width="stretch", key="r-lines",
+                         column_config={"Line": st.column_config.TextColumn(disabled=True),
+                                        "Whose": st.column_config.SelectboxColumn(options=WHO_OPTS)})
+
+    if st.button("Save rules", type="primary"):
+        r = fresh()[1].rules
+        for _, x in aed.iterrows():
+            if PAYER_OPTS.get(x["Paid by"]):
+                r["payer"][x["Account"]] = PAYER_OPTS[x["Paid by"]]
+            else:
+                r["payer"].pop(x["Account"], None)
+        r["contrib"] = [{"match": str(x["Description contains"]), "from": x["From"].lower(),
+                         "to": "zuha" if x["From"] == "Aneeq" else "aneeq"}
+                        for _, x in ced.iterrows() if str(x["Description contains"] or "").strip() and x["From"]]
+        old_not = {str(o.get("not", "")).lower(): o.get("notLabel") for o in r.get("patcat") or [] if o.get("not")}
+        r["patcat"] = [{"match": str(x["Matches"]).lower(), "cat": x["Line"], "label": x["Store"] or x["Matches"],
+                        **({"not": str(x["Except"]).lower(), "notLabel": old_not.get(str(x["Except"]).lower()) or x["Except"]}
+                           if str(x["Except"] or "").strip() else {})}
+                       for _, x in ped.iterrows() if str(x["Matches"] or "").strip() and x["Line"]]
+        r["deductions"] = [{"line": x["Line"], "who": WHO_KEY.get(x["Whose pay"] or "Zuha") or "zuha",
+                            **({"amount": float(x["Amount"])} if x["Amount"] == x["Amount"] and x["Amount"] else {})}
+                           for _, x in ded.iterrows() if x["Line"]]
+        name_id = {v: k for k, v in pnames.items()}
+        r["projrule"] = [{"match": str(x["Description matches"]).strip().lower(), "project": name_id[x["Big expense"]]}
+                         for _, x in pred.iterrows() if str(x["Description matches"] or "").strip() and x["Big expense"] in name_id]
+        r["shift"] = [{"match": str(x["Merchant contains"]).strip().lower(), "from_day": int(x["From day"] or 20)}
+                      for _, x in shed.iterrows() if str(x["Merchant contains"] or "").strip() and x["From day"] == x["From day"]]
+        r["learn"] = {}
+        for _, x in lred.iterrows():
+            k = str(x["Merchant"] or "").strip().lower()
+            if k and (x["Line"] or x["Who"]):
+                star = {"★ " + p["name"]: p["id"] for p in L.projects}
+                line = {"project": star[x["Line"]]} if x["Line"] in star else ({"line": x["Line"]} if x["Line"] else {})
+                r["learn"][k] = {**line, **({"who": WHO_KEY[x["Who"]]} if x["Who"] else {})}
+        r["merchant"], r["recat"] = {}, {}
+        for _, x in med.iterrows():
+            k = str(x["Merchant"] or "").strip()
+            if not k:
                 continue
-            t = {"id": tid, "month": r["date"][:7], "date": r["date"], "desc": r["desc"], "mk": merchant_key(r["desc"]),
-                 "spend": spend, "category": r.get("category") or "Uncategorized", "account": r["account"],
-                 "statement_id": statement_id, "added_by": added_by}
-            if ext:
-                t["ext_id"] = ext
-            new.append(t)
-            used.add(tid)
-        return new, dup
+            if x["Line"]:
+                r["recat"][k] = x["Line"]
+            if x["Counts toward"]:
+                r["merchant"][k] = WHO_KEY[x["Counts toward"]]
+        for _, x in led.iterrows():
+            if x["Whose"]:
+                r["category"][x["Line"]] = WHO_KEY[x["Whose"]]
+            else:
+                r["category"].pop(x["Line"], None)
+            default_ex = bool(DEFAULT_EXCLUDE.search(x["Line"]))
+            if bool(x["Counted as spending"]) == (not default_ex):
+                r["exclude"].pop(x["Line"], None)
+            else:
+                r["exclude"][x["Line"]] = not bool(x["Counted as spending"])
+        save_config("rules", r)
+        st.success("Rules saved.")
+        st.rerun()
 
 
-def rename_line(plan: dict, rules: dict, projects: list[dict], txns: list[dict], old: str, new: str) -> dict[str, dict]:
-    """Rename a budget line everywhere it's used: budgets (standard and per month), section, owner, store and merchant
-    rules, remembered choices, split rules, pay deductions, big-expense funding, and charges put on it by hand.
-    Changes plan/rules/projects in place and returns the changes to make to transactions (id -> fields)."""
-    def swap(d: dict):
-        if old in d:
-            d[new] = d.pop(old)
-    swap(plan["budgets"])
-    for v in plan["byMonth"].values():
-        swap(v)
-    swap(plan["groups"])
-    for k in ("category", "exclude"):
-        swap(rules.setdefault(k, {}))
-    for k in ("catmap", "recat"):
-        for kk, v in list((rules.get(k) or {}).items()):
-            if v == old:
-                rules[k][kk] = new
-    for v in (rules.get("learn") or {}).values():
-        if v.get("line") == old:
-            v["line"] = new
-    for r in rules.get("patcat") or []:
-        if r.get("cat") == old:
-            r["cat"] = new
-    for r in rules.get("deductions") or []:
-        if r.get("line") == old:
-            r["line"] = new
-    sp = rules.get("split")
-    if sp is None:  # write out the built-in split so the rename sticks
-        sp = rules["split"] = Ledger(rules=rules, plan=plan, projects=projects, txns=[]).split_rules()
-    for r in sp:
-        r["lines"] = [new if l == old else l for l in r.get("lines") or []]
-    for p in projects:
-        for f in p.get("funding") or []:
-            if f.get("line") == old:
-                f["line"] = new
-    changes: dict[str, dict] = {}
-    for t in txns:
-        ch = {k: new for k in ("cat_override", "for_line") if t.get(k) == old}
-        if t.get("category") == old:
-            ch["category"] = new
-        if ch:
-            changes[t["id"]] = ch
-    return changes
+def page_setup(d: dict):
+    html('<div class="lg-h2" style="margin-top:4px">Bring in your current ledger</div>')
+    st.write("The ledger is empty. Upload `seed_data.json` (exported from the old ledger page) to start with your "
+             "budget, rules, big expenses and the transactions already sorted.")
+    f = st.file_uploader("seed_data.json", type=["json"])
+    if f and st.button("Import", type="primary"):
+        seed = json.loads(f.getvalue())
+        store = get_store()
+        rename = {"catOverride": "cat_override", "projItem": "proj_item", "forLine": "for_line", "movedFrom": "moved_from"}
+        txns = [{rename.get(k, k): v for k, v in t.items()} for t in seed.get("transactions", [])]
+        store.save_config("rules", seed.get("rules") or {})
+        store.save_config("plan", seed.get("plan") or {})
+        store.save_config("projects", seed.get("projects") or [])
+        store.save_txns(txns)
+        bump()
+        st.success(f"Imported {len(txns)} transactions.")
+        st.rerun()
 
+
+# ---------------------------------------------------------------- main
+def main():
+    html(ui.CSS)
+    person, email = current_person()
+    store = get_store()
+    d = load_data(store, st.session_state.get("v", 0))
+    L = ledger_from(d)
+    months = L.months()
+
+    top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
+    top_l.markdown(ui.header(person, APP_TITLE), unsafe_allow_html=True)
+    m = top_r.selectbox("Month", list(reversed(months)), format_func=month_label, key="month") if months else None
+    top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload",
+                 on_click=lambda: st.session_state.update(page="Statements"))
+    page = st.segmented_control("Page", PAGES, default="Overview", key="page", label_visibility="collapsed") or "Overview"
+
+    with st.sidebar:
+        st.markdown(f"**{PEOPLE.get(person, person)}**  \n{email if email != 'local' else 'Local test mode'}")
+        if st.button("Refresh data", width="stretch"):
+            bump()
+            st.rerun()
+        if email != "local":
+            st.button("Sign out", on_click=st.logout, width="stretch")
+        if store.kind == "local":
+            st.caption("Storage: this computer only (Google isn't configured).")
+
+    if not d["txns"] and not d["config"]:
+        page_setup(d)
+        if page != "Statements":
+            return
+    if page == "Statements":
+        page_statements(L, d, person)
+    elif page == "Rules":
+        page_rules(L, d)
+    elif page == "Big expenses":
+        page_big(L, m)
+    elif page == "Settle up":
+        page_settle(L, m)
+    elif not m:
+        st.info("Add a statement on the Statements page to get started.")
+    elif page == "Overview":
+        page_overview(L, m)
+    elif page == "Budget":
+        page_budget(L, m, person)
+    elif page == "Not in budget":
+        page_unbudgeted(L, m)
+    elif page == "Transactions":
+        page_transactions(L, m, person)
+    auto_sync(d, person)
+
+
+def auto_sync(d: dict, person: str):
+    """Once per visit, after the page is already showing: pull new bank transactions if the last sync is over
+    20 hours old, then redraw. The page stays usable while this runs and never breaks if the bank feed is slow."""
+    if not feed_urls() or st.session_state.get("autosync-done"):
+        return
+    st.session_state["autosync-done"] = True
+    last = float((d["config"].get("sync") or {}).get("last") or 0)
+    if time.time() - last <= 20 * 3600:
+        return
+    with st.spinner("Checking your banks for new transactions…"):
+        try:
+            msg, _ = run_sync(person)
+        except Exception:  # noqa: BLE001 — never block the app on the feed
+            return
+    st.session_state["flash-sync"] = msg
+    st.rerun()
+
+
+main()
+if st.session_state.get("flash-sync"):
+    st.toast(st.session_state.pop("flash-sync"))
