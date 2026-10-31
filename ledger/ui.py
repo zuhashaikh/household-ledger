@@ -85,7 +85,7 @@ def e(s) -> str:
     return escape(str(s if s is not None else ""))
 
 
-def header(person: str, title: str = "Zuha & Aneeq Ledger") -> str:
+def header(person: str, title: str = "Zuha & Aneeq Expense Tracker") -> str:
     return (f'<div class="lg-eyebrow">Household spending · signed in as {e(PEOPLE.get(person, person))}</div>'
             f'<div class="lg-title">{e(title)}</div>'
             '<div class="lg-legend" style="margin:-6px 0 12px"><span><span class="dot d-zuha"></span>Zuha</span>'
