@@ -202,13 +202,13 @@ def page_overview(L: Ledger, m: str):
 
 
 def page_budget(L: Ledger, m: str, person: str = "zuha"):
-    html(f'<div class="lg-h2" style="margin-top:4px">Budget check by person, {ui.e(month_label(m))}</div>')
+    html(ui.budget(L, m).replace('<div class="lg-h2">', '<div class="lg-h2" style="margin-top:4px">', 1))
+    html(f'<div class="lg-h2">Budget check by person, {ui.e(month_label(m))}</div>')
     names = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}
     who_label = st.segmented_control("Person", list(names.values()), default=names.get(person, names["zuha"]),
                                      key="budget-person", label_visibility="collapsed") or names.get(person, names["zuha"])
     who = next(k for k, v in names.items() if v == who_label)
     html(ui.person_budget(L, m, who))
-    html(ui.budget(L, m))
     own = m in L.plan["byMonth"]
     rows = L.budget_rows(m)
     SEC_LABEL = {k: l for k, l in SECTIONS}
