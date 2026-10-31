@@ -20,7 +20,7 @@ from ledger import bankfeed, ui
 from ledger.store import GoogleStore, LocalStore, now_iso
 
 # ---- The app's name. Change it here and it updates the page heading, sign-in screen and browser tab. ----
-APP_TITLE = "Zuha & Aneeq Ledger"
+APP_TITLE = "Zuha & Aneeq Expense Tracker"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initial_sidebar_state="collapsed")
 
