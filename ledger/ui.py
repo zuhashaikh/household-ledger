@@ -85,7 +85,7 @@ def e(s) -> str:
     return escape(str(s if s is not None else ""))
 
 
-def header(person: str, title: str = "Zuha & Aneeq Expense Tracker") -> str:
+def header(person: str, title: str = "Zuha & Aneeq Ledger") -> str:
     return (f'<div class="lg-eyebrow">Household spending · signed in as {e(PEOPLE.get(person, person))}</div>'
             f'<div class="lg-title">{e(title)}</div>'
             '<div class="lg-legend" style="margin:-6px 0 12px"><span><span class="dot d-zuha"></span>Zuha</span>'
@@ -211,12 +211,16 @@ def budget(L: Ledger, mo: str) -> str:
                if owner else '<span class="why">no owner yet</span>')
         payers = " ".join(f'<span class="num" style="white-space:nowrap;margin-right:8px"><span class="dot d-{"none" if k == "unset" else k}"></span>{bank[k]} {m(paid[k])}</span>'
                           for k in ("zuha", "aneeq", "shared", "unset") if abs(paid.get(k, 0)) >= .5)
-        cross = ""
+        late: dict[str, float] = {}
+        for t in L.month_txns(mo):
+            if t.get("catchup_of") and t.get("moved_from") and t["moved_from"] != mo and L.cat_of(t) == r["cat"]:
+                late[t["moved_from"]] = late.get(t["moved_from"], 0.0) + t["spend"]
+        cross = "".join(f'<span class="why">{m(v)} of it paid in {e(month_label(k).split()[0])}</span>' for k, v in sorted(late.items()) if v >= .5)
         if owner in ("zuha", "aneeq"):
             other = "aneeq" if owner == "zuha" else "zuha"
             amt = paid.get(other, 0) + paid.get("shared", 0) / 2
             if amt >= .5:
-                cross = (f'<span class="why" style="color:var(--{other})"><b>{PEOPLE[other]} paid {m(amt)}</b> of {PEOPLE[owner]}&#39;s line</span>')
+                cross += (f'<span class="why" style="color:var(--{other})"><b>{PEOPLE[other]} paid {m(amt)}</b> of {PEOPLE[owner]}&#39;s line</span>')
         if not b and not r["all"]:
             st = '<span class="pill nobud">No budget</span>'
         elif not b:

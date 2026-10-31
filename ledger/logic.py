@@ -171,7 +171,7 @@ class Ledger:
         return not t.get("moved_from") and not t.get("synthetic") and self.month_of(t) != str(t.get("date", ""))[:7]
 
     def months(self) -> list[str]:
-        return sorted({self.month_of(t) for t in self.txns})
+        return sorted({self.month_of(t) for t in self.parts()})
 
     def deductions(self) -> list[dict]:
         """Budget lines paid straight out of someone's paycheck, so they never appear on a statement.
@@ -236,10 +236,85 @@ class Ledger:
             return parts
         return None
 
+    def catchup_lines(self) -> list[str]:
+        """Lines paid as a monthly fee, where a payment first covers its own month, then any earlier month still
+        unpaid, then the months ahead. Default: every line with "school" in its name."""
+        r = self.rules.get("catchup")
+        if r is None:
+            r = [l for l in self.budget_lines() if "school" in l.lower()]
+        return [l for l in r if l]
+
+    def _catchup(self, parts: list[dict]) -> list[dict]:
+        lines = set(self.catchup_lines())
+        if not lines:
+            return parts
+        ledger_months = sorted({self.month_of(t) for t in self.txns}) if self.txns else []
+        if not ledger_months:
+            return parts
+        first = ledger_months[0]
+        keep, by_line = [], {}
+        for t in parts:
+            c = self.cat_of(t) if not (self.contrib_of(t) or self.proj_of(t)) else None
+            if c in lines and float(t.get("spend") or 0) > 0:
+                by_line.setdefault(c, []).append(t)
+            else:
+                keep.append(t)
+        for line, ts in by_line.items():
+            filled: dict[str, float] = {}
+            bud = lambda mo: float(self.plan_for(mo).get(line) or 0)
+            for t in sorted(ts, key=lambda t: (self.month_of(t), t.get("date", ""), t["id"])):
+                own, amt = self.month_of(t), float(t["spend"])
+                earlier, mo = [], first
+                while mo < own:
+                    earlier.append(mo)
+                    mo = self._next(mo)
+                later, mo = [], self._next(own)
+                for _ in range(24):
+                    later.append(mo)
+                    mo = self._next(mo)
+                alloc: list[tuple[str, float]] = []
+                for mo in [own] + earlier + later:
+                    room = bud(mo) - filled.get(mo, 0.0)
+                    if room <= .005:
+                        continue
+                    a = round(min(room, amt), 2)
+                    alloc.append((mo, a))
+                    filled[mo] = filled.get(mo, 0.0) + a
+                    amt = round(amt - a, 2)
+                    if amt <= .005:
+                        break
+                if amt > .005 or not alloc:  # nothing budgeted anywhere: it stays in its own month
+                    alloc.append((own, amt))
+                    filled[own] = filled.get(own, 0.0) + amt
+                if len(alloc) == 1 and alloc[0][0] == own:
+                    keep.append(t)
+                    continue
+                for mo, a in alloc:
+                    keep.append({**t, "id": f"{t['id']}@{mo}", "catchup_of": t.get("split_of") or t["id"], "spend": a,
+                                 "cat_override": line, "month": mo, "moved_from": own, "paid_on": t.get("date"),
+                                 "catchup_note": "paid in " + month_label(own) if mo != own else ""})
+        return keep
+
+    def parts(self) -> list[dict]:
+        """Every charge as it counts: split across lines where a split rule applies, and school payments spread
+        over the months they pay for."""
+        key = (id(self.txns), len(self.txns), id(self.plan), id(self.rules))
+        if getattr(self, "_parts_key", None) != key:
+            base = [p for t in self.txns for p in (self.split_parts(t) or [t])]
+            self._parts = self._catchup(base)
+            self._parts_key = key
+        return self._parts
+
+    def months_paid_for(self, t: dict) -> list[tuple[str, float]]:
+        """For one charge (as stored), the months its money counts in, when spread by the catch-up rule."""
+        out = [(p["month"], p["spend"]) for p in self.parts() if p.get("catchup_of") == t["id"]]
+        return sorted(out)
+
     def month_txns(self, m: str, with_deductions: bool = True, split: bool = True) -> list[dict]:
-        own = [t for t in self.txns if self.month_of(t) == m]
         if split:
-            own = [p for t in own for p in (self.split_parts(t) or [t])]
+            own = [t for t in self.parts() if self.month_of(t) == m]
+        else:
+            own = [t for t in self.txns if self.month_of(t) == m]
         return own + (self.deduction_txns(m) if with_deductions and own else [])
 
     def plan_for(self, m: str) -> dict:
