@@ -69,7 +69,15 @@ pip install -r requirements.txt
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # fill in, or leave out [auth]/[google] to test
 streamlit run app.py
 ```
-Without `[google]`, data is kept in `.data/` on your computer. Without `[auth]`, there's no sign-in (local testing only).
+Without `[google]`, data is kept in `.data/` on your computer. Without `[auth]`, the app stays locked; to test locally without sign-in, run `LEDGER_LOCAL=1 streamlit run app.py`.
 
-## Later: connecting Chase and Wells Fargo directly
-The data model already has an account per transaction and dedupes repeats, so a bank feed (SimpleFIN Bridge or Teller) can be added as another way in next to PDFs.
+## Bank sync (Chase and Wells Fargo)
+1. In SimpleFIN Bridge, link Chase. Aneeq links Wells Fargo with his own bank login (in the same SimpleFIN account, or his own).
+2. In SimpleFIN, under **Apps**, create a new connection and copy the **setup token**.
+3. In the ledger, go to **Statements → Bank sync → Connect banks**, paste the token, press **Connect**.
+4. Copy the `[simplefin]` block it shows into the app's Secrets (⋮ → Settings → Secrets) and reboot the app.
+
+The app then syncs when someone opens it and the last sync is over 20 hours old, and on **Sync banks now**.
+Each sync looks back to 5 days before the last one (89 days the first time). Charges already in the ledger, from
+an earlier sync or a PDF, are skipped. New merchants follow your rules; anything left over is sent to Claude in one batch.
+PayPal isn't needed: it pays from Chase, so those purchases come in through Chase.
