@@ -101,10 +101,49 @@ class Ledger:
             r = [{"match": "ota scuba swim", "from_day": 20, "label": "Ota Swim"}]
         return [x for x in r if x and x.get("match")]
 
+    @staticmethod
+    def _merchant_root(desc: str) -> str:
+        words = [w for w in learn_key(desc).split() if w not in {"www", "the", "card", "purchase"}]
+        return words[0] if words else ""
+
+    def refund_matches(self) -> dict[str, dict]:
+        """Refunds paired with the earlier charge they reverse: same account, same amount to the cent, same
+        merchant, charged within 60 days before. A refund counts in its charge's month so the two net to zero."""
+        sig = (len(self.txns), sum(1 for t in self.txns if t.get("spend", 0) < 0))
+        if getattr(self, "_refund_sig", None) == sig:
+            return self._refund_map
+        import datetime as _dt
+        day = lambda d: _dt.date.fromisoformat(d).toordinal()
+        charges: dict[tuple, list] = {}
+        for t in self.txns:
+            if t.get("spend", 0) > 0 and not t.get("synthetic"):
+                charges.setdefault((t.get("account"), round(t["spend"], 2), self._merchant_root(t.get("desc", ""))), []).append(t)
+        used, out = set(), {}
+        refunds = sorted((t for t in self.txns if t.get("spend", 0) < 0 and not t.get("synthetic")), key=lambda t: t["date"])
+        for r in refunds:
+            if "zelle" in str(r.get("desc", "")).lower() or self.contrib_of(r):
+                continue
+            root = self._merchant_root(r.get("desc", ""))
+            if not root:
+                continue
+            cands = [c for c in charges.get((r.get("account"), round(-r["spend"], 2), root), [])
+                     if c["id"] not in used and 0 <= day(r["date"]) - day(c["date"]) <= 60]
+            if cands:
+                c = max(cands, key=lambda c: c["date"])  # the most recent matching charge
+                used.add(c["id"])
+                out[r["id"]] = c
+        self._refund_sig, self._refund_map = sig, out
+        return out
+
     def month_of(self, t: dict) -> str:
-        """The month a charge counts in: its own month, unless it was moved by hand or a next-month rule applies."""
+        """The month a charge counts in: its own month, unless it was moved by hand, it's a refund of an earlier
+        charge (then it counts with that charge), or a next-month rule applies."""
         if t.get("moved_from") or t.get("synthetic"):
             return t["month"]
+        if t.get("spend", 0) < 0:
+            c = self.refund_matches().get(t.get("id"))
+            if c:
+                return self.month_of(c)
         d = str(t.get("date") or "")
         base = d[:7] or t.get("month", "")
         key = learn_key(t.get("desc", ""))
