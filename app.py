@@ -6,6 +6,7 @@ Secrets (see .streamlit/secrets.toml.example): [auth] Google sign-in, [people] w
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -25,7 +26,7 @@ st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initia
 # Who may sign in. [people] in the secrets overrides this.
 DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
 
-PAGES = ["Overview", "Budget", "Transactions", "Big expenses", "Settle up", "Statements", "Rules"]
+PAGES = ["Overview", "Budget", "Transactions", "Not in budget", "Big expenses", "Settle up", "Statements", "Rules"]
 # The three colours used everywhere: purple = Zuha, blue = Aneeq, gold = Shared.
 WHO_NAME = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq", "shared": "🟡 Shared"}
 WHO_OPTS = [""] + list(WHO_NAME.values())
@@ -275,6 +276,86 @@ def page_transactions(L: Ledger, m: str, person: str):
         st.success(st.session_state.pop("flash"))
 
 
+def page_unbudgeted(L: Ledger, m: str | None):
+    """Counted spending that isn't on any budget line, with a way to put each charge on one."""
+    html('<div class="lg-h2" style="margin-top:4px">Not in the budget</div>'
+         '<p class="lg-note" style="margin:0 0 10px">Spending that doesn&#39;t fall on any line of your budget sheet '
+         '(e.g. Other, Subscriptions, Charity). Pick a budget line under <b>Assign to</b> and press Save.</p>')
+    budget_lines = [l for l in L.budget_lines() if not L.is_excluded(l)]
+    scope = st.radio("Show", [f"{month_label(m)}" if m else "This month", "All months"], horizontal=True, key="nib-scope")
+    months = L.months() if scope == "All months" or not m else [m]
+    rows = []
+    for mo in months:
+        for t in L.month_txns(mo, with_deductions=False):
+            if L.contrib_of(t) or L.proj_of(t):
+                continue
+            c = L.cat_of(t)
+            if L.is_excluded(c) or c in budget_lines:
+                continue
+            rows.append((t, c))
+    rows.sort(key=lambda x: x[0]["date"], reverse=True)
+    if not rows:
+        st.success("Everything counted as spending is on a budget line.")
+        return
+    total = sum(t["spend"] for t, _ in rows)
+    by_cat: dict[str, float] = {}
+    by_who: dict[str, float] = {}
+    for t, c in rows:
+        by_cat[c] = by_cat.get(c, 0) + t["spend"]
+        w = L.payer_of(t) or "unset"
+        by_who[w] = by_who.get(w, 0) + t["spend"]
+    chips = " · ".join(f'{ui.e(c)} <b class="num">{ui.m(v)}</b>' for c, v in sorted(by_cat.items(), key=lambda x: -x[1]))
+    paid = " · ".join(f'<span class="dot d-{w}"></span>{ {"zuha": "Zuha", "aneeq": "Aneeq", "shared": "Joint"}.get(w, "Payer not set") } <b class="num">{ui.m(v)}</b>'
+                      for w, v in sorted(by_who.items(), key=lambda x: -x[1]))
+    html(f'<div class="lg-summary" style="grid-template-columns:minmax(0,1fr) minmax(0,2fr)">'
+         f'<div><span class="lg-eyebrow">Not in the budget</span><span class="big num">{ui.m(total)}</span>'
+         f'<span class="lg-muted" style="font-size:13px">{len(rows)} charge{"s" if len(rows) != 1 else ""}</span></div>'
+         f'<div><span class="lg-eyebrow">By category</span><span style="font-size:14px">{chips}</span>'
+         f'<span class="lg-eyebrow" style="margin-top:6px">Paid from</span><span style="font-size:14px">{paid}</span></div></div>')
+
+    KEEP = "— keep as is —"
+    df = pd.DataFrame([{"Date": t["date"], "Merchant": t["desc"], "Amount": t["spend"],
+                        "Paid from": PAID_NAME.get(L.payer_of(t) or "", UNSET), "Account": t.get("account", ""),
+                        "Category now": c, "Assign to": KEEP} for t, c in rows])
+    ids = [t["id"] for t, _ in rows]
+    ed = st.data_editor(df, hide_index=True, width="stretch", key=f"nib-{scope}-{m}",
+                        column_config={"Date": st.column_config.TextColumn(disabled=True, width="small"),
+                                       "Merchant": st.column_config.TextColumn(disabled=True, width="large"),
+                                       "Amount": st.column_config.NumberColumn(format="dollar", disabled=True, width="small"),
+                                       "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
+                                       "Account": st.column_config.TextColumn(disabled=True),
+                                       "Category now": st.column_config.TextColumn(disabled=True),
+                                       "Assign to": st.column_config.SelectboxColumn(options=[KEEP] + budget_lines, help="A line from your budget sheet")})
+    remember = st.checkbox("Remember for the same merchant: apply to every month and to future statements", value=True, key="nib-remember")
+    if st.button("Save assignments", type="primary", key="nib-save"):
+        byid = {t["id"]: t for t in L.txns}
+        learn, changes = {}, {}
+        for i, (_, r) in enumerate(ed.iterrows()):
+            if r["Assign to"] in (None, "", KEEP):
+                continue
+            t = byid[ids[i]]
+            if remember:
+                learn.setdefault(learn_key(t["desc"]), {})["line"] = r["Assign to"]
+                if t.get("cat_override"):
+                    changes[t["id"]] = {"cat_override": None}
+            else:
+                changes[t["id"]] = {"cat_override": r["Assign to"]}
+        if learn:
+            rules = fresh()[1].rules
+            rules.setdefault("learn", {})
+            for k, v in learn.items():
+                rules["learn"][k] = {**rules["learn"].get(k, {}), **v}
+            save_config("rules", rules)
+        if changes:
+            update_txns(changes)
+        if learn or changes:
+            n = sum(1 for t in L.txns if learn_key(t["desc"]) in learn) if learn else len(changes)
+            st.session_state["nib-flash"] = f"Assigned {n} charge{'s' if n != 1 else ''}" + (" and remembered for next time." if learn else ".")
+            st.rerun()
+    if st.session_state.get("nib-flash"):
+        st.success(st.session_state.pop("nib-flash"))
+
+
 def page_big(L: Ledger):
     html('<div class="lg-h2" style="margin-top:4px">Big expenses</div><p class="lg-note" style="margin:0 0 12px">One-off costs paid for by budget set aside '
          'from regular lines (usually Household Goods + Trips in Extras II). Tag a charge to one from Transactions by choosing ★ in the Line column.</p>')
@@ -336,14 +417,28 @@ def page_statements(L: Ledger, d: dict, person: str):
          'Claude reads each one; you check the totals and pick whose account it is, then add it to the ledger. '
          'The original PDF is saved to the shared Drive folder.</p>')
     files = st.file_uploader("Bank or card statement PDFs", type=["pdf"], accept_multiple_files=True, key="uploader")
+    saved = d.get("statements") or []
+    by_hash = {s_.get("file_hash"): s_ for s_ in saved if s_.get("file_hash")}
     if files and st.button("Read statements", type="primary", disabled=not api_key):
         from ledger.parse import read_statement
         pend = st.session_state.setdefault("pending", {})
+        pend_hashes = {p_.get("hash") for p_ in pend.values()}
         for f in files:
+            pdf = f.getvalue()
+            h = hashlib.sha256(pdf).hexdigest()
+            if h in by_hash:  # exact same file: don't send it to Claude again
+                s_ = by_hash[h]
+                st.info(f"{f.name} was already added on {str(s_.get('uploaded_at', ''))[:10]} by "
+                        f"{PEOPLE.get(s_.get('uploaded_by'), s_.get('uploaded_by', ''))} ({s_.get('account', '')}, "
+                        f"{s_.get('period_start', '')} to {s_.get('period_end', '')}), so it wasn't read again.")
+                continue
+            if h in pend_hashes:
+                st.info(f"{f.name} is already waiting below to be added.")
+                continue
             with st.spinner(f"Reading {f.name}… this usually takes under a minute"):
                 try:
-                    pdf = f.getvalue()
-                    pend[f.name] = {"pdf": pdf, "res": read_statement(pdf, L, api_key, model), "name": f.name}
+                    pend[f.name] = {"pdf": pdf, "hash": h, "res": read_statement(pdf, L, api_key, model), "name": f.name}
+                    pend_hashes.add(h)
                 except Exception as e:  # noqa: BLE001 — show the reason and keep going with the others
                     st.error(f"{f.name}: {e}")
     if not api_key:
@@ -364,12 +459,24 @@ def page_statements(L: Ledger, d: dict, person: str):
                             else f":orange[{label} {money(mine, True)} vs {money(theirs, True)} on the statement]")
                 return f"{label} {money(mine, True)}"
             st.markdown(chk(out, tot.get("purchases"), "Money out") + " · " + chk(back, tot.get("credits"), "Payments & credits"))
+            preview_new, preview_dup = L.add_parsed(rows, "preview", person)
+            same_period = [s_ for s_ in saved if s_.get("account") == res["account"] and res.get("start") and res.get("end")
+                           and s_.get("period_start") == res.get("start") and s_.get("period_end") == res.get("end")]
+            if same_period:
+                st.warning(f"This looks like a statement already added on {str(same_period[0].get('uploaded_at', ''))[:10]} "
+                           f"(same account and dates). Only charges not already in the ledger will be added.")
+            if not preview_new:
+                st.markdown(f":green[All {len(rows)} transactions are already in the ledger. Nothing new to add.]")
+            elif preview_dup:
+                st.markdown(f"**{len(preview_new)} new** transactions will be added; {preview_dup} already in the ledger will be skipped.")
+            else:
+                st.markdown(f"**{len(preview_new)} new** transactions will be added.")
             cur = L.rules["payer"].get(res["account"])
             labels = list(PAYER_OPTS)
             idx = next((i for i, (k, v) in enumerate(PAYER_OPTS.items()) if v == cur), 0)
             payer = st.selectbox("Whose account is this?", labels, index=idx, key=f"payer-{name}")
             c1, c2 = st.columns([1, 4])
-            if c1.button("Add to ledger", key=f"add-{name}", type="primary", disabled=not PAYER_OPTS[payer]):
+            if c1.button("Add to ledger", key=f"add-{name}", type="primary", disabled=not PAYER_OPTS[payer] or not preview_new):
                 store = get_store()
                 dd, LL = fresh()
                 sid = uuid.uuid4().hex[:12]
@@ -377,19 +484,22 @@ def page_statements(L: Ledger, d: dict, person: str):
                 meta = store.add_statement({"id": sid, "filename": name, "account": res["account"],
                                             "period_start": res.get("start") or "", "period_end": res.get("end") or "",
                                             "uploaded_by": person, "uploaded_at": now_iso(), "n_added": len(new),
-                                            "n_skipped": dup}, p["pdf"])
+                                            "n_skipped": dup, "file_hash": p.get("hash", "")}, p["pdf"])
                 store.save_txns(dd["txns"] + new)
                 if LL.rules["payer"].get(res["account"]) != PAYER_OPTS[payer]:
                     LL.rules["payer"][res["account"]] = PAYER_OPTS[payer]
                     store.save_config("rules", LL.rules)
                 st.session_state["pending"].pop(name, None)
                 bump()
-                st.success(f"Added {len(new)} transactions" + (f", skipped {dup} already here" if dup else "") + f" from {meta['filename']}.")
+                st.session_state["st-flash"] = (f"Added {len(new)} transactions" + (f", skipped {dup} already in the ledger" if dup else "")
+                                                + f" from {meta['filename']}.")
                 st.rerun()
             if c2.button("Discard", key=f"drop-{name}"):
                 st.session_state["pending"].pop(name, None)
                 st.rerun()
 
+    if st.session_state.get("st-flash"):
+        st.success(st.session_state.pop("st-flash"))
     sts = sorted(d.get("statements") or [], key=lambda s: s.get("uploaded_at", ""), reverse=True)
     if sts:
         st.markdown("**Saved statements**")
@@ -578,6 +688,8 @@ def main():
         page_overview(L, m)
     elif page == "Budget":
         page_budget(L, m)
+    elif page == "Not in budget":
+        page_unbudgeted(L, m)
     elif page == "Transactions":
         page_transactions(L, m, person)
 
