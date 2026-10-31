@@ -85,6 +85,7 @@ class Ledger:
     plan: dict = field(default_factory=lambda: {"budgets": {}, "byMonth": {}, "groups": {}})
     projects: list = field(default_factory=list)
     txns: list = field(default_factory=list)
+    fund_cfg: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.rules = norm_rules(self.rules)
@@ -276,9 +277,12 @@ class Ledger:
             return None
         if t.get("project"):
             return self.proj_by_id(t["project"])  # "none" means taken off a big expense on purpose
-        pid = self.learned(t).get("project")
+        lrn = self.learned(t)
+        pid = lrn.get("project")
         if pid and self.proj_by_id(pid):
             return self.proj_by_id(pid)
+        if lrn.get("line"):  # a remembered budget line wins over the automatic big-expense rules
+            return None
         d = str(t.get("desc") or "").lower()
         for x in self.proj_rules():
             try:
@@ -315,7 +319,11 @@ class Ledger:
         short = est - funded
         base = funded + max(0.0, short)
         plan_pct = (fz + max(0.0, short) / 2) / base if base else 0.5
-        z_pct = {"even": 0.5, "zuha": 1.0, "aneeq": 0.0}.get(p.get("split") or "", plan_pct)
+        sp = p.get("split") or "even"
+        if sp == "custom":
+            z_pct = min(1.0, max(0.0, float(p.get("zuha_pct") or 50) / 100))
+        else:
+            z_pct = {"zuha": 1.0, "aneeq": 0.0, "plan": plan_pct}.get(sp, 0.5)  # default: 50:50
         txns = sorted([t for t in self.txns if (self.proj_of(t) or {}).get("id") == p["id"] and not self.contrib_of(t)], key=lambda t: t["date"])
         spent = sum(t["spend"] for t in txns)
         names = {i["name"] for i in p.get("items") or []}
@@ -336,6 +344,10 @@ class Ledger:
         return self.proj_stats(pj)["z_pct"]
 
     def asides_for(self, m: str) -> dict[str, list[dict]]:
+        """Money reserved on regular lines for big expenses. Replaced by the Extras II fund, so nothing is reserved
+        any more (kept so older saved plans still load)."""
+        if True:
+            return {}
         out: dict[str, list[dict]] = {}
         for p in self.projects:
             for f in p.get("funding") or []:
@@ -455,15 +467,124 @@ class Ledger:
             budget[key] = budget.get(key, 0) + max(0.0, float(v or 0) - a)
         return {"rows": rows, "budget": budget, "aside_tot": aside_tot}
 
+    def person_budget(self, m: str, who: str) -> dict:
+        """One person's budget check for a month: their lines plus half of shared lines (net of money set aside
+        for big expenses) against the spending that counts toward them. Big expenses are left out (paid from the
+        set-asides); spending they own that isn't on a budget line is included as unbudgeted."""
+        res = self.compute(m)
+        plan, asides = self.plan_for(m), self.asides_for(m)
+        rows, cats = [], {r["cat"]: r for r in res["cats"]}
+        for c in sorted(set(plan) | set(cats)):
+            if self.is_excluded(c) or self.plan["groups"].get(c) == DEFAULT_SECTION:
+                continue
+            owner = self.rules["category"].get(c)
+            share = 1.0 if owner == who else 0.5 if owner == "shared" else 0.0
+            avail = max(0.0, float(plan.get(c) or 0) - sum(a["amt"] for a in asides.get(c, [])))
+            r = cats.get(c)
+            spent = (r[who] + r["shared"] / 2) if r else 0.0
+            budget = avail * share
+            if budget or abs(spent) >= .5:
+                rows.append({"line": c, "owner": owner, "share": share, "budget": budget, "spent": spent,
+                             "on_plan": c in plan, "section": self.plan["groups"].get(c) or ("Other budget lines" if c in plan else "Not in the budget")})
+        budget = sum(r["budget"] for r in rows)
+        spent = sum(r["spent"] for r in rows)
+        return {"rows": rows, "budget": budget, "spent": spent, "left": budget - spent,
+                "unassigned": res["tot"]["none"], "paid_by_them": res["paid"].get(who, 0.0)}
+
     def settle_rows(self) -> list[dict]:
-        run, out = 0.0, []
+        """Aneeq's dues to Zuha, month by month.
+        Due this month: his lines, his half of shared lines and his share of big expenses that Zuha paid, plus any
+        money Zuha sent him, less Zuha's share of anything he paid. If that comes out negative (he paid for more of
+        hers than she did of his), it's absorbed against Core and Extras I that month: Zuha never owes him.
+        Money he sends Zuha first pays what he owes; anything beyond that is a credit toward his next months' dues.
+        balance > 0: he owes Zuha. balance < 0: he has credit."""
+        bal, out = 0.0, []
         for m in self.months():
             s = self.compute(m)["settle"]
-            run += s["net"]
+            spend_net = s["net"] + s["aneeq_to_zuha"]          # everything except what he sent
+            due = max(0.0, spend_net)
+            absorbed = max(0.0, -spend_net)
+            start = bal
+            bal = bal + due - s["aneeq_to_zuha"]
             out.append({"month": m, "gross": s["net"] + s["aneeq_to_zuha"] - s["zuha_to_aneeq"],
-                        "he_sent": s["aneeq_to_zuha"], "you_sent": s["zuha_to_aneeq"], "net": s["net"],
-                        "running": run, "skipped": s["skipped"]})
+                        "he_sent": s["aneeq_to_zuha"], "you_sent": s["zuha_to_aneeq"], "due": due, "net": bal - start,
+                        "absorbed": absorbed, "start": start, "running": bal, "skipped": s["skipped"]})
         return out
+
+    def owed_through(self, m: str) -> tuple[float, float]:
+        """(Aneeq's balance after month m: + owes Zuha, − credit; change during month m)."""
+        prev, cur = 0.0, 0.0
+        for r in self.settle_rows():
+            if r["month"] > m:
+                break
+            prev, cur = cur, r["running"]
+        return cur, cur - prev
+
+    # ---------- Extras II fund ----------
+    def fund_settings(self) -> dict:
+        f = dict(self.fund_cfg or {})
+        f.setdefault("start", "2026-09")
+        f.setdefault("opening", 0.0)
+        f.setdefault("closed", [])
+        if "topups" not in f:  # from the budget sheet: Aneeq's Roth money for big expenses (no date yet = planned)
+            f["topups"] = [{"month": "", "who": x.get("owner"), "amount": self.fund_amt(x), "note": f"{x.get('label', '')} for {p['name']}"}
+                           for p in self.projects for x in p.get("funding") or [] if not x.get("line") and x.get("owner")]
+        return f
+
+    def _next(self, m: str) -> str:
+        y, mo = int(m[:4]), int(m[5:7]) + 1
+        return f"{y + (mo > 12)}-{(mo - 1) % 12 + 1:02d}"
+
+    def fund_month(self, m: str) -> dict:
+        """One month of the Extras II fund."""
+        fs = self.fund_settings()
+        plan = self.plan_for(m)
+        x2 = sum(float(v or 0) for c, v in plan.items() if self.plan["groups"].get(c) == DEFAULT_SECTION and not self.is_excluded(c))
+        res = self.compute(m) if m in self.months() else {"cats": []}
+        cats = {r["cat"]: r for r in res["cats"]}
+        lines = {c for c in plan if self.plan["groups"].get(c) in ("Home Budget", "Extras I")} | \
+                {c for c in cats if self.plan["groups"].get(c) in ("Home Budget", "Extras I")}
+        leftover = sum(float(plan.get(c) or 0) - (cats[c]["all"] if c in cats else 0.0) for c in lines if not self.is_excluded(c))
+        sm = self.section_matrix(m)["rows"] if m in self.months() else {}
+        regular = sum(sm.get(DEFAULT_SECTION, {}).values())
+        big = sum(v for k, r in sm.items() if k.startswith("big:") for v in r.values())
+        by_proj = {p["name"]: sum(sm.get("proj:" + p["id"], {}).values()) for p in self.projects if sm.get("proj:" + p["id"])}
+        tops = [t for t in fs["topups"] if str(t.get("month") or "") == m]
+        closed = m in fs["closed"]
+        lo = max(0.0, leftover) if closed else 0.0
+        return {"month": m, "x2": x2, "leftover_raw": leftover, "leftover": lo, "closed": closed,
+                "topups": sum(float(t.get("amount") or 0) for t in tops), "regular": regular, "big": big, "by_proj": by_proj,
+                "net": x2 + lo + sum(float(t.get("amount") or 0) for t in tops) - regular - big}
+
+    def fund(self, through: str | None = None) -> dict:
+        fs = self.fund_settings()
+        last = max(self.months() + [fs["start"]]) if through is None else through
+        m, bal, rows = fs["start"], float(fs["opening"] or 0), []
+        while m <= last and len(rows) < 120:
+            r = self.fund_month(m)
+            bal += r["net"]
+            r["balance"] = bal
+            rows.append(r)
+            m = self._next(m)
+        # Projection: the standard monthly Extras II budget less the recent everyday Extras II spending,
+        # then the rest of every planned big expense and any undated top-ups.
+        std = sum(float(v or 0) for c, v in self.plan["budgets"].items() if self.plan["groups"].get(c) == DEFAULT_SECTION)
+        std_lines = {c for c in self.plan["budgets"] if self.plan["groups"].get(c) == DEFAULT_SECTION}
+        recent = [sum(x["all"] for x in self.compute(r["month"])["cats"] if x["cat"] in std_lines)
+                  for r in rows if r["month"] in self.months()][-3:]
+        everyday = sum(recent) / len(recent) if recent else 0.0
+        per_month = std - everyday
+        planned = {p["name"]: max(0.0, self.proj_stats(p)["est"] - self.proj_stats(p)["spent"]) for p in self.projects}
+        planned = {k: v for k, v in planned.items() if v >= 1}
+        undated = sum(float(t.get("amount") or 0) for t in fs["topups"] if not t.get("month"))
+        low = bal - sum(planned.values()) + undated
+        months_to_zero = None
+        if low < 0 and per_month > 0:
+            import math
+            months_to_zero = math.ceil(-low / per_month)
+        return {"rows": rows, "balance": bal, "std": std, "everyday": everyday, "per_month": per_month,
+                "planned": planned, "undated_topups": undated, "low": low, "months_to_zero": months_to_zero,
+                "pending": [r for r in rows if not r["closed"] and r["month"] in self.months()]}
 
     # ---------- importing ----------
     def add_parsed(self, rows: list[dict], statement_id: str, added_by: str, tolerance_days: int = 3) -> tuple[list[dict], int]:
