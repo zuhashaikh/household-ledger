@@ -31,6 +31,7 @@ def build_prompt(ledger: Ledger) -> str:
         if not ledger.is_excluded(c) and t.get("mk") and t["mk"] not in seen:
             seen[t["mk"]] = c
     seen.update(ledger.rules.get("recat") or {})
+    seen.update({k: v["line"] for k, v in (ledger.rules.get("learn") or {}).items() if v.get("line")})
     known = "\n".join(f"{k} → {v}" for k, v in list(seen.items())[:120]) or "(none yet)"
     catmap = "; ".join(f"{k} → {v}" for k, v in (ledger.rules.get("catmap") or {}).items())
     accts = ledger.accounts()

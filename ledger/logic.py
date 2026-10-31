@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 PEOPLE = {"zuha": "Zuha", "aneeq": "Aneeq", "shared": "Shared"}
-PAYER_LABEL = {"zuha": "Chase (Zuha)", "aneeq": "Wells Fargo (Aneeq)", "shared": "Joint", "unset": "Payer not set"}
+PAYER_LABEL = {"zuha": "Zuha (Chase + pay)", "aneeq": "Aneeq (Wells Fargo)", "shared": "Joint", "unset": "Payer not set"}
 SECTIONS = [("Home Budget", "Core budget"), ("Extras I", "Extras I"), ("Extras II (Split 50:50)", "Extras II")]
 DEFAULT_SECTION = "Extras II (Split 50:50)"
 DEFAULT_EXCLUDE = re.compile(r"transfer|credit card payment|payment|paycheck|income|deposit|refund reversal", re.I)
@@ -37,6 +37,22 @@ def merchant_key(desc: str) -> str:
     k = re.sub(r"\s+", " ", k).strip()
     k = " ".join(k.split(" ")[:3])
     return k or d.strip()
+
+
+_PREFIXES = re.compile(r"^(card purchase with pin|card purchase|debit card purchase|purchase authorized on|pos purchase|pos|recurring payment|ach debit|online transfer to|online payment to|web pymt|sq|tst|sp|py|dd)\b\s*")
+
+
+def learn_key(desc: str) -> str:
+    """Merchant identity for remembered choices: the merchant's name without store numbers, card prefixes
+    or reference codes. Keeps the person in Zelle descriptions, so each payee is remembered separately."""
+    d = str(desc or "").lower()
+    if "*" in d:
+        head, tail = d.split("*", 1)
+        d = head if len(head.strip()) >= 4 else tail
+    d = re.sub(r"[^a-z0-9&' ]+", " ", d)
+    d = _PREFIXES.sub("", d.strip())
+    words = [w for w in d.split() if not re.search(r"\d", w) and len(w) > 1 and w not in {"tx", "ca", "wa", "ny", "nj", "nc", "com", "bill"}]
+    return " ".join(words[:5]) or d.strip()
 
 
 def fnv_id(s: str) -> str:
@@ -78,8 +94,29 @@ class Ledger:
     def months(self) -> list[str]:
         return sorted({t["month"] for t in self.txns})
 
-    def month_txns(self, m: str) -> list[dict]:
-        return [t for t in self.txns if t.get("month") == m]
+    def deductions(self) -> list[dict]:
+        """Budget lines paid straight out of someone's paycheck, so they never appear on a statement.
+        Each counts as spent every month: the given amount, or that month's budget for the line."""
+        d = self.rules.get("deductions")
+        if d is None:  # not set yet: Zuha's health insurance comes out of her Remote pay
+            d = [{"line": "Health Insurance", "who": "zuha"}]
+        return [x for x in d if x and x.get("line")]
+
+    def deduction_txns(self, m: str) -> list[dict]:
+        out = []
+        for x in self.deductions():
+            amt = float(x.get("amount") or 0) or float(self.plan_for(m).get(x["line"]) or 0)
+            if amt:
+                who = x.get("who") or "zuha"
+                out.append({"id": f"ded:{m}:{x['line']}", "month": m, "date": f"{m}-01", "synthetic": True,
+                            "desc": f"{x['line']} (taken from {PEOPLE.get(who, who)}'s pay)", "spend": amt,
+                            "category": x["line"], "cat_override": x["line"], "account": "Paycheck deduction",
+                            "payer": who, "person": who if x.get("counts_toward") == "self" else None, "mk": ""})
+        return out
+
+    def month_txns(self, m: str, with_deductions: bool = True) -> list[dict]:
+        own = [t for t in self.txns if t.get("month") == m]
+        return own + (self.deduction_txns(m) if with_deductions and own else [])
 
     def plan_for(self, m: str) -> dict:
         return self.plan["byMonth"].get(m) or self.plan["budgets"]
@@ -116,8 +153,11 @@ class Ledger:
                 continue
         return None
 
+    def learned(self, t: dict) -> dict:
+        return (self.rules.get("learn") or {}).get(learn_key(t.get("desc", ""))) or {}
+
     def cat_of(self, t: dict) -> str:
-        return (t.get("cat_override") or self.pat_cat(t) or self.rules["recat"].get(t.get("mk", ""))
+        return (t.get("cat_override") or self.learned(t).get("line") or self.pat_cat(t) or self.rules["recat"].get(t.get("mk", ""))
                 or self.rules["catmap"].get(t.get("category", "")) or t.get("category") or "Uncategorized")
 
     def is_excluded(self, cat: str) -> bool:
@@ -129,6 +169,8 @@ class Ledger:
     def resolve(self, t: dict) -> tuple[str | None, str]:
         if t.get("person"):
             return t["person"], "this transaction only"
+        if self.learned(t).get("who"):
+            return self.learned(t)["who"], "remembered for this merchant"
         mk = t.get("mk", "")
         if self.rules["merchant"].get(mk):
             return self.rules["merchant"][mk], "merchant rule"
@@ -140,7 +182,7 @@ class Ledger:
         return None, "not assigned yet"
 
     def payer_of(self, t: dict) -> str | None:
-        return self.rules["payer"].get(t.get("account") or "") or None
+        return t.get("payer") or self.rules["payer"].get(t.get("account") or "") or None
 
     def contrib_of(self, t: dict) -> dict | None:
         if not t.get("spend"):

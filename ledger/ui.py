@@ -11,7 +11,7 @@ CSS = """
 :root{
   --bg:#F3F5F2; --surface:#FFFFFF; --sunk:#E8ECE7; --line:#D5DBD3;
   --ink:#1C2320; --muted:#5D6862; --accent:#1F5E57;
-  --zuha:#8E3A6A; --aneeq:#2B6A8E; --shared:#A87A1E; --none:#9AA39E;
+  --zuha:#7B3FA0; --aneeq:#2560A8; --shared:#C4901A; --none:#9AA39E;
   --good:#2E7D4F; --warn:#B26A00; --bad:#B23A2E;
   --display:"Bricolage Grotesque",ui-sans-serif,system-ui,sans-serif;
   --body:"Public Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -87,7 +87,9 @@ def e(s) -> str:
 
 def header(person: str, title: str = "Zuha & Aneeq Ledger") -> str:
     return (f'<div class="lg-eyebrow">Household spending · signed in as {e(PEOPLE.get(person, person))}</div>'
-            f'<div class="lg-title">{e(title)}</div>')
+            f'<div class="lg-title">{e(title)}</div>'
+            '<div class="lg-legend" style="margin:-6px 0 12px"><span><span class="dot d-zuha"></span>Zuha</span>'
+            '<span><span class="dot d-aneeq"></span>Aneeq</span><span><span class="dot d-shared"></span>Shared</span></div>')
 
 
 def summary(L: Ledger, mo: str) -> str:
@@ -96,10 +98,17 @@ def summary(L: Ledger, mo: str) -> str:
     owe = 0 if abs(net) < 1 else net
     lbl = "Zuha owes Aneeq" if owe < 0 else "Owed to Zuha"
     col = "aneeq" if owe < 0 else "zuha"
-    return ('<div class="lg-summary">'
-            f'<div><span class="lg-eyebrow"><span class="dot d-zuha"></span>Spent from Chase (Zuha)</span><span class="big num">{m(res["paid"]["zuha"])}</span></div>'
-            f'<div><span class="lg-eyebrow"><span class="dot d-aneeq"></span>Spent from Wells Fargo (Aneeq)</span><span class="big num">{m(res["paid"]["aneeq"])}</span></div>'
-            f'<div><span class="lg-eyebrow">{lbl}</span><span class="big num" style="color:var(--{col})">{m(abs(owe))}</span></div>'
+    pay = {"zuha": 0.0, "aneeq": 0.0}
+    for t in L.deduction_txns(mo) if L.month_txns(mo, with_deductions=False) else []:
+        pay[t["payer"]] = pay.get(t["payer"], 0) + t["spend"]
+
+    def cell(who, name, bank):
+        total = res["paid"][who]
+        sub = f'{bank} {m(total - pay[who])} · {m(pay[who])} taken from pay' if pay[who] else f'From {bank}'
+        return (f'<div><span class="lg-eyebrow"><span class="dot d-{who}"></span>Spent by {name}</span>'
+                f'<span class="big num">{m(total)}</span><span class="lg-muted num" style="font-size:13px">{sub}</span></div>')
+    return ('<div class="lg-summary">' + cell("zuha", "Zuha", "Chase") + cell("aneeq", "Aneeq", "Wells Fargo")
+            + f'<div><span class="lg-eyebrow">{lbl}</span><span class="big num" style="color:var(--{col})">{m(abs(owe))}</span></div>'
             '</div>')
 
 
