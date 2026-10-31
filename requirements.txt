@@ -6,3 +6,4 @@ google-auth>=2.29
 google-auth-oauthlib>=1.2
 google-api-python-client>=2.120
 anthropic>=0.40
+requests>=2.31
