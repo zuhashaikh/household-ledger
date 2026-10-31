@@ -360,7 +360,8 @@ class Ledger:
         cats: dict[str, dict] = {}
         tot = dict(zuha=0.0, aneeq=0.0, shared=0.0, none=0.0, all=0.0)
         paid = dict(zuha=0.0, aneeq=0.0, shared=0.0, unset=0.0)
-        settle = dict(net=0.0, skipped=0.0, aneeq_to_zuha=0.0, zuha_to_aneeq=0.0, big=0.0, aneeq_for_big=0.0)
+        settle = dict(net=0.0, skipped=0.0, aneeq_to_zuha=0.0, zuha_to_aneeq=0.0, big=0.0, aneeq_for_big=0.0,
+                      by={"Home Budget": 0.0, "Extras I": 0.0, DEFAULT_SECTION: 0.0, "other": 0.0})
         unassigned = 0
 
         def new_row(c):
@@ -390,6 +391,8 @@ class Ledger:
                 if pay:
                     pz = 1.0 if pay == "zuha" else 0.5 if pay == "shared" else 0.0
                     settle["net"] += (pz - zp) * t["spend"]
+                    sec = pj.get("section") or DEFAULT_SECTION
+                    settle["by"][sec if sec in settle["by"] else "other"] += (pz - zp) * t["spend"]
                 else:
                     settle["skipped"] += t["spend"]
                 continue
@@ -410,6 +413,7 @@ class Ledger:
             paid[pay or "unset"] += t["spend"]
             if p and pay:
                 settle["net"] += share(pay, t["spend"]) - share(p, t["spend"])
+                settle["by"][self.section_of(c)] += share(pay, t["spend"]) - share(p, t["spend"])
             else:
                 settle["skipped"] += t["spend"]
         for c, v in self.plan_for(m).items():
@@ -491,24 +495,44 @@ class Ledger:
         return {"rows": rows, "budget": budget, "spent": spent, "left": budget - spent,
                 "unassigned": res["tot"]["none"], "paid_by_them": res["paid"].get(who, 0.0)}
 
+    SETTLE_ORDER = [("carried", "Owed from earlier months"), ("Home Budget", "Core budget"), ("Extras I", "Extras I"),
+                    (DEFAULT_SECTION, "Extras II and big expenses"), ("other", "Other (not on a budget line)"),
+                    ("sent", "Money Zuha sent him")]
+
     def settle_rows(self) -> list[dict]:
-        """Aneeq's dues to Zuha, month by month.
-        Due this month: his lines, his half of shared lines and his share of big expenses that Zuha paid, plus any
-        money Zuha sent him, less Zuha's share of anything he paid. If that comes out negative (he paid for more of
-        hers than she did of his), it's absorbed against Core and Extras I that month: Zuha never owes him.
-        Money he sends Zuha first pays what he owes; anything beyond that is a credit toward his next months' dues.
+        """Aneeq's dues to Zuha, month by month, and where his payments went.
+        Dues per section: his lines, his half of shared lines and his share of big expenses that Zuha paid, less
+        Zuha's share of anything he paid. Money Zuha sends him is also due.
+        Payments are applied in order: anything still owed from earlier months, then Core, Extras I, Extras II
+        (incl. big expenses), other, money Zuha sent him. What's left of the money he sent is credit for next month.
+        If he paid for more of Zuha's share than she did of his (his extra spending), that covers his other dues
+        first; any of it left over is absorbed against Core and Extras I that month, since Zuha never owes him.
         balance > 0: he owes Zuha. balance < 0: he has credit."""
         bal, out = 0.0, []
         for m in self.months():
             s = self.compute(m)["settle"]
-            spend_net = s["net"] + s["aneeq_to_zuha"]          # everything except what he sent
-            due = max(0.0, spend_net)
-            absorbed = max(0.0, -spend_net)
+            by = dict(s["by"])
+            dues = {"carried": max(0.0, bal), **{k: max(0.0, v) for k, v in by.items()}, "sent": s["zuha_to_aneeq"]}
+            spend_extra = sum(-v for v in by.values() if v < 0)       # his extra spending, by section
+            cash = s["aneeq_to_zuha"] + max(0.0, -bal)                 # money he sent + credit carried in
+            alloc = []
+            for key, label in self.SETTLE_ORDER:
+                due = dues.get(key, 0.0)
+                from_spend = min(due, spend_extra) if key != "carried" else 0.0   # his own extra spending can't pay old balances
+                spend_extra -= from_spend
+                from_cash = min(due - from_spend, cash)
+                cash -= from_cash
+                alloc.append({"key": key, "label": label, "due": due, "covered_by_spending": from_spend,
+                              "paid": from_cash, "unpaid": due - from_spend - from_cash})
+            unpaid = sum(a["unpaid"] for a in alloc)
             start = bal
-            bal = bal + due - s["aneeq_to_zuha"]
+            bal = unpaid if unpaid > 0.005 else -cash
+            due_month = sum(max(0.0, v) for v in by.values()) + s["zuha_to_aneeq"]
             out.append({"month": m, "gross": s["net"] + s["aneeq_to_zuha"] - s["zuha_to_aneeq"],
-                        "he_sent": s["aneeq_to_zuha"], "you_sent": s["zuha_to_aneeq"], "due": due, "net": bal - start,
-                        "absorbed": absorbed, "start": start, "running": bal, "skipped": s["skipped"]})
+                        "he_sent": s["aneeq_to_zuha"], "you_sent": s["zuha_to_aneeq"],
+                        "due": max(0.0, s["net"] + s["aneeq_to_zuha"]), "due_by_section": due_month,
+                        "net": bal - start, "absorbed": spend_extra, "start": start, "running": bal,
+                        "alloc": alloc, "skipped": s["skipped"]})
         return out
 
     def owed_through(self, m: str) -> tuple[float, float]:

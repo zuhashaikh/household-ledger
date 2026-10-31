@@ -236,7 +236,7 @@ def big_card(L: Ledger, p: dict) -> str:
             f'</div>{charges_html}</div>')
 
 
-def settle(L: Ledger) -> str:
+def settle(L: Ledger, mo: str | None = None) -> str:
     rows = L.settle_rows()
     if not rows:
         return '<p class="lg-note">Add a statement to see what&#39;s owed.</p>'
@@ -263,11 +263,41 @@ def settle(L: Ledger) -> str:
             f'<span class="big num" style="color:var(--{col})">{verdict}</span></div></div>'
             '<p class="lg-note"><b>Due each month</b>: Aneeq&#39;s lines, his half of shared lines and his share of big expenses that Zuha paid, '
             'plus money Zuha sent him. If he paid for more of Zuha&#39;s share than she did of his, that extra is absorbed against Core and Extras I '
-            'that month (Zuha never owes him). <b>Money he sends</b> first pays what he owes; anything beyond that is credit toward his next months&#39; dues.</p>'
+            'that month (Zuha never owes him). <b>Money he sends</b> pays, in order: anything owed from earlier months, Core, Extras I, '
+            'Extras II and big expenses, then money Zuha sent him. Anything left over is credit toward his next month&#39;s dues.</p>'
             '<div class="lg-scroll" style="margin-top:12px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Start of month</th>'
             '<th class="r">His share Zuha paid</th><th class="r">Zuha sent him</th><th class="r">His extra, absorbed</th><th class="r">Due this month</th>'
             '<th class="r">He sent</th><th class="r">End of month</th></tr></thead>'
-            f'<tbody>{body}</tbody></table></div>')
+            f'<tbody>{body}</tbody></table></div>' + settle_breakdown(L, rows, mo))
+
+
+def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
+    r = next((x for x in rows if x["month"] == mo), rows[-1] if rows else None)
+    if not r:
+        return ""
+    trs = []
+    for a in r["alloc"]:
+        if a["due"] < .005:
+            continue
+        unpaid = (f'<b style="color:var(--zuha)">{m(a["unpaid"], True)}</b>' if a["unpaid"] >= .005 else '<span class="good-t">paid</span>')
+        trs.append(f'<tr><td><b>{e(a["label"])}</b></td><td class="r num">{m(a["due"], True)}</td>'
+                   f'<td class="r num">{m(a["covered_by_spending"], True) if a["covered_by_spending"] >= .005 else "–"}</td>'
+                   f'<td class="r num">{m(a["paid"], True) if a["paid"] >= .005 else "–"}</td><td class="r num">{unpaid}</td></tr>')
+    if r["running"] <= -1:
+        end = f'<b style="color:var(--aneeq)">{m(-r["running"], True)} left over → credit toward next month</b>'
+    elif r["running"] >= 1:
+        end = f'<b style="color:var(--zuha)">{m(r["running"], True)} still owed at the end of the month</b>'
+    else:
+        end = '<b class="good-t">All paid</b>'
+    sent = f'He sent {m(r["he_sent"], True)}' + (f' and had {m(-r["start"], True)} credit from earlier' if r["start"] <= -1 else "")
+    ab = f' {m(r["absorbed"], True)} of his own extra spending was absorbed.' if r["absorbed"] >= 1 else ""
+    return (f'<div class="lg-h2">Where Aneeq&#39;s money went, {e(month_label(r["month"]))}</div>'
+            f'<p class="lg-note" style="margin:0 0 8px">{sent}. It pays, in order: anything owed from earlier months, Core, Extras I, '
+            f'Extras II and big expenses, other, then money Zuha sent him. Whatever is left is credit for next month.{ab}</p>'
+            '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>In order</th><th class="r">He owed</th>'
+            '<th class="r">Covered by his own spending</th><th class="r">Paid from money he sent</th><th class="r">Still owed</th></tr></thead>'
+            f'<tbody>{"".join(trs) or "<tr><td colspan=5 class=lg-muted>Nothing owed this month.</td></tr>"}'
+            f'<tr class="tot"><td colspan="5">{end}</td></tr></tbody></table></div>')
 
 
 def person_budget(L: Ledger, mo: str, who: str) -> str:
