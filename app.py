@@ -325,6 +325,11 @@ def page_transactions(L: Ledger, m: str, person: str):
             status = f"Money from {PEOPLE[cb['from']]}" + (f" for {pj['name']}" if pj else f" for {t['for_line']}" if t.get("for_line") else "") + " · settle-up"
         elif pj:
             status = f"Big expense: {pj['name']}"
+        elif ex and L.never_spending(t) and not t.get("cat_override"):
+            d = t.get("desc") or ""
+            status = ("Not counted: money between you, already counted from Zuha's side" if L.payer_of(t) == "aneeq" and L.never_spending(t) == "Transfer" and ("zuha" in d.lower() or "shaikh" in d.lower())
+                      else "Not counted: paying off a card (its charges are counted)" if L.never_spending(t) == "Credit Card Payment"
+                      else "Not counted: moving money between your own accounts")
         elif ex:
             status = "Not counted as spending"
         elif L.learned(t).get("line") and not t.get("cat_override"):
