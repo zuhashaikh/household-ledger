@@ -95,6 +95,8 @@ def header(person: str, title: str = "Zuha & Aneeq Ledger") -> str:
 def summary(L: Ledger, mo: str) -> str:
     res = L.compute(mo)
     owed, change = L.owed_through(mo)
+    sr = next((r for r in L.settle_rows() if r["month"] == mo), None)
+    ahead_txt = (f' · he paid {sr["x2_pct"] * 100:.0f}% of Extras II' if sr and sr["x2_pct"] is not None and sr["x2_pct"] > .505 else "")
     pay = {"zuha": 0.0, "aneeq": 0.0}
     for t in L.deduction_txns(mo) if L.month_txns(mo, with_deductions=False) else []:
         pay[t["payer"]] = pay.get(t["payer"], 0) + t["spend"]
@@ -109,7 +111,7 @@ def summary(L: Ledger, mo: str) -> str:
                if owed > -1 else
                f'<div><span class="lg-eyebrow">Aneeq&#39;s credit</span><span class="big num" style="color:var(--aneeq)">{m(-owed)}</span>')
             + f'<span class="lg-muted num" style="font-size:13px">{"counts toward his next dues · " if owed <= -1 else ""}through {e(month_label(mo).split()[0])}'
-            + (f' · {"+" if change > 0 else "−"}{m(abs(change))} this month' if abs(change) >= 1 else "") + '</span></div>'
+            + (f' · {"+" if change > 0 else "−"}{m(abs(change))} this month' if abs(change) >= 1 else "") + ahead_txt + '</span></div>'
             '</div>')
 
 
@@ -223,6 +225,9 @@ def big_card(L: Ledger, p: dict) -> str:
     split_txt = "50:50" if abs(z - .5) < 1e-9 else ("All Zuha" if z >= .999 else "All Aneeq" if z <= .001 else f"{z*100:.0f}% Zuha / {100 - z*100:.0f}% Aneeq")
     owners = sorted({i["who"] for i in p.get("items") or [] if i.get("who")})
     fhead = f'Split {split_txt} · paid from the Extras II fund' + (" · some items belong to one person" if owners else "")
+    ps = L.proj_settle(p)
+    an = (f'<p class="lg-note" style="margin:8px 0 0"><span class="dot d-aneeq"></span><b>Aneeq&#39;s share of charges so far: {m(ps["share"])}</b>'
+          f' · paid on his own cards {m(ps["direct"])}.</p>') if abs(ps["share"]) >= 1 else ""
     charges = "".join(f'<tr><td class="num lg-muted" style="white-space:nowrap">{e(t["date"])}</td><td><b>{e(t["desc"])}</b><span class="why">{e(t.get("account",""))} · {e(PAYER_LABEL.get(L.payer_of(t) or "unset"))}{(" · " + e(t["proj_item"])) if t.get("proj_item") else ""}</span></td><td class="r num">{m(t["spend"], True)}</td></tr>' for t in s["txns"])
     charges_html = (f'<div class="lg-eyebrow" style="margin:14px 0 6px">Charges</div><div class="lg-scroll"><table class="lg-table"><tbody>{charges}</tbody></table></div>'
                     if charges else f'<p class="lg-note">No charges yet. In Transactions, choose “★ {e(p["name"])}” as a charge&#39;s line.</p>')
@@ -232,7 +237,8 @@ def big_card(L: Ledger, p: dict) -> str:
             '<div class="lg-cols">'
             f'<div><div class="lg-eyebrow" style="margin-bottom:6px">Items</div><div class="lg-scroll"><table class="lg-table"><thead><tr><th>Item</th><th>Whose</th><th class="r">Estimated</th><th class="r">Spent so far</th></tr></thead><tbody>{items or "<tr><td colspan=4 class=lg-muted>No items yet.</td></tr>"}</tbody></table></div></div>'
             f'<div><div class="lg-eyebrow" style="margin-bottom:6px">How it&#39;s paid for</div><p class="lg-note" style="margin:0">{fhead}. '
-            'Each charge comes out of the shared fund; in the settle-up each of you covers your share, and whoever pays more is credited.</p></div>'
+            'Each charge comes out of the Extras II fund. In the settle-up, Aneeq covers his share of charges Zuha paid after Core and Extras I; '
+            'if he sends more, it counts as him paying more of Extras II, before any credit.</p>' + an + '</div>'
             f'</div>{charges_html}</div>')
 
 
@@ -241,6 +247,7 @@ def settle(L: Ledger, mo: str | None = None) -> str:
     if not rows:
         return '<p class="lg-note">Add a statement to see what&#39;s owed.</p>'
     run = rows[-1]["running"]
+    ahead_html = ""
     if run >= 1:
         verdict, col = f"Aneeq owes Zuha {m(run)}", "zuha"
     elif run <= -1:
@@ -255,19 +262,22 @@ def settle(L: Ledger, mo: str | None = None) -> str:
         you = ("+" + m(r["you_sent"])) if r["you_sent"] >= .5 else "–"
         he = ("−" + m(r["he_sent"])) if r["he_sent"] >= .5 else "–"
         absorbed = f'<span class="lg-muted">{m(r["absorbed"])}</span>' if r["absorbed"] >= 1 else "–"
+        pct = f'{r["x2_pct"] * 100:.0f}%' if r["x2_pct"] is not None else "–"
         body_rows.append(f'<tr><td><b>{e(month_label(r["month"]))}</b>{skipped}</td><td class="r num">{bal(r["start"])}</td>'
                          f'<td class="r num">{m(r["gross"])}</td><td class="r num">{you}</td><td class="r num">{absorbed}</td>'
-                         f'<td class="r num"><b>{m(r["due"])}</b></td><td class="r num">{he}</td><td class="r num">{bal(r["running"])}</td></tr>')
+                         f'<td class="r num"><b>{m(r["due"])}</b></td><td class="r num">{he}</td><td class="r num">{pct}</td><td class="r num">{bal(r["running"])}</td></tr>')
     body = "".join(body_rows)
     return ('<div class="lg-summary" style="grid-template-columns:1fr"><div><span class="lg-eyebrow">Settle-up</span>'
-            f'<span class="big num" style="color:var(--{col})">{verdict}</span></div></div>'
+            f'<span class="big num" style="color:var(--{col})">{verdict}</span>{ahead_html}</div></div>'
             '<p class="lg-note"><b>Due each month</b>: Aneeq&#39;s lines, his half of shared lines and his share of big expenses that Zuha paid, '
             'plus money Zuha sent him. If he paid for more of Zuha&#39;s share than she did of his, that extra is absorbed against Core and Extras I '
             'that month (Zuha never owes him). <b>Money he sends</b> pays, in order: anything owed from earlier months, Core, Extras I, '
-            'Extras II and big expenses, then money Zuha sent him. Anything left over is credit toward his next month&#39;s dues.</p>'
+            'his share of Extras II and big expenses, then money Zuha sent him. Anything beyond that goes to more of that month&#39;s Extras II '
+            'and big expenses (he paid more than half of them, noted as a percentage). Only what&#39;s left after all of Extras II is paid is credit '
+            'toward his next month&#39;s dues.</p>'
             '<div class="lg-scroll" style="margin-top:12px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Start of month</th>'
             '<th class="r">His share Zuha paid</th><th class="r">Zuha sent him</th><th class="r">His extra, absorbed</th><th class="r">Due this month</th>'
-            '<th class="r">He sent</th><th class="r">End of month</th></tr></thead>'
+            '<th class="r">He sent</th><th class="r">His part of Extras II</th><th class="r">End of month</th></tr></thead>'
             f'<tbody>{body}</tbody></table></div>' + settle_breakdown(L, rows, mo))
 
 
@@ -289,6 +299,12 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
         end = f'<b style="color:var(--zuha)">{m(r["running"], True)} still owed at the end of the month</b>'
     else:
         end = '<b class="good-t">All paid</b>'
+    if r["x2_extra"] >= .005:
+        trs.append(f'<tr><td><b>More of Extras II and big expenses</b><span class="why">beyond his half</span></td><td class="r num">–</td><td class="r num">–</td>'
+                   f'<td class="r num">{m(r["x2_extra"], True)}</td><td class="r num"><span class="good-t">paid</span></td></tr>')
+    if r["x2_pct"] is not None and r["x2_total"] >= 1:
+        end += (f'<br><span class="dot d-aneeq"></span><b>Aneeq paid {r["x2_pct"] * 100:.0f}% of Extras II and big expenses</b> '
+                f'<span class="lg-muted">({m(r["x2_his"], True)} of {m(r["x2_total"], True)} in {e(month_label(r["month"]))})</span>')
     sent = f'He sent {m(r["he_sent"], True)}' + (f' and had {m(-r["start"], True)} credit from earlier' if r["start"] <= -1 else "")
     ab = f' {m(r["absorbed"], True)} of his own extra spending was absorbed.' if r["absorbed"] >= 1 else ""
     tx = L.transfers(r["month"])
@@ -302,7 +318,8 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
                'and tick <b>Not between us</b>.</p>') if tx_rows else ""
     return (f'<div class="lg-h2">Where Aneeq&#39;s money went, {e(month_label(r["month"]))}</div>'
             f'<p class="lg-note" style="margin:0 0 8px">{sent}. It pays, in order: anything owed from earlier months, Core, Extras I, '
-            f'Extras II and big expenses, other, then money Zuha sent him. Whatever is left is credit for next month.{ab}</p>'
+            f'his share of Extras II and big expenses, other, money Zuha sent him, then more of Extras II and big expenses. '
+            f'Only what&#39;s left after that is credit for next month.{ab}</p>'
             '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>In order</th><th class="r">He owed</th>'
             '<th class="r">Covered by his own spending</th><th class="r">Paid from money he sent</th><th class="r">Still owed</th></tr></thead>'
             f'<tbody>{"".join(trs) or "<tr><td colspan=5 class=lg-muted>Nothing owed this month.</td></tr>"}'

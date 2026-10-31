@@ -375,7 +375,7 @@ class Ledger:
         tot = dict(zuha=0.0, aneeq=0.0, shared=0.0, none=0.0, all=0.0)
         paid = dict(zuha=0.0, aneeq=0.0, shared=0.0, unset=0.0)
         settle = dict(net=0.0, skipped=0.0, aneeq_to_zuha=0.0, zuha_to_aneeq=0.0, big=0.0, aneeq_for_big=0.0,
-                      by={"Home Budget": 0.0, "Extras I": 0.0, DEFAULT_SECTION: 0.0, "other": 0.0})
+                      by={"Home Budget": 0.0, "Extras I": 0.0, DEFAULT_SECTION: 0.0, "other": 0.0}, x2_total=0.0, x2_aneeq=0.0)
         unassigned = 0
 
         def new_row(c):
@@ -407,6 +407,9 @@ class Ledger:
                     settle["net"] += (pz - zp) * t["spend"]
                     sec = pj.get("section") or DEFAULT_SECTION
                     settle["by"][sec if sec in settle["by"] else "other"] += (pz - zp) * t["spend"]
+                    if sec == DEFAULT_SECTION:
+                        settle["x2_total"] += t["spend"]
+                        settle["x2_aneeq"] += (1 - pz) * t["spend"]
                 else:
                     settle["skipped"] += t["spend"]
                 continue
@@ -428,6 +431,9 @@ class Ledger:
             if p and pay:
                 settle["net"] += share(pay, t["spend"]) - share(p, t["spend"])
                 settle["by"][self.section_of(c)] += share(pay, t["spend"]) - share(p, t["spend"])
+                if self.section_of(c) == DEFAULT_SECTION:
+                    settle["x2_total"] += t["spend"]
+                    settle["x2_aneeq"] += t["spend"] if pay == "aneeq" else t["spend"] / 2 if pay == "shared" else 0.0
             else:
                 settle["skipped"] += t["spend"]
         for c, v in self.plan_for(m).items():
@@ -514,14 +520,16 @@ class Ledger:
                     ("sent", "Money Zuha sent him")]
 
     def settle_rows(self) -> list[dict]:
-        """Aneeq's dues to Zuha, month by month, and where his payments went.
+        """Aneeq's dues to Zuha, month by month, and where his payments went. No tagging needed.
         Dues per section: his lines, his half of shared lines and his share of big expenses that Zuha paid, less
         Zuha's share of anything he paid. Money Zuha sends him is also due.
-        Payments are applied in order: anything still owed from earlier months, then Core, Extras I, Extras II
-        (incl. big expenses), other, money Zuha sent him. What's left of the money he sent is credit for next month.
+        Money he sends pays, in order: anything owed from earlier months, Core, Extras I, Extras II (incl. big
+        expenses), other, money Zuha sent him. What's left goes to more of that month's Extras II and big expenses
+        (he simply paid more than half of them; x2_pct says how much), up to all of what Zuha paid there. Only what's
+        left after that is credit for next month.
         If he paid for more of Zuha's share than she did of his (his extra spending), that covers his other dues
-        first; any of it left over is absorbed against Core and Extras I that month, since Zuha never owes him.
-        balance > 0: he owes Zuha. balance < 0: he has credit."""
+        first; any of it left over is absorbed, since Zuha never owes him.
+        running > 0: he owes Zuha. running < 0: he has credit."""
         bal, out = 0.0, []
         for m in self.months():
             s = self.compute(m)["settle"]
@@ -538,14 +546,22 @@ class Ledger:
                 cash -= from_cash
                 alloc.append({"key": key, "label": label, "due": due, "covered_by_spending": from_spend,
                               "paid": from_cash, "unpaid": due - from_spend - from_cash})
+            x2a = next(a for a in alloc if a["key"] == DEFAULT_SECTION)
+            total = s["x2_total"]
+            his_x2 = s["x2_aneeq"] + min(0.0, by[DEFAULT_SECTION]) + (x2a["due"] - x2a["unpaid"])   # what he's covered of Extras II
+            extra_x2 = min(cash, max(0.0, total - his_x2)) if total > 0 else 0.0
+            cash -= extra_x2
+            his_x2 += extra_x2
+            x2_pct = his_x2 / total if total > 0 else None
             unpaid = sum(a["unpaid"] for a in alloc)
             start = bal
-            bal = unpaid if unpaid > 0.005 else -cash
+            bal = unpaid if unpaid > 0.005 else (-cash if cash > 0.005 else 0.0)
             due_month = sum(max(0.0, v) for v in by.values()) + s["zuha_to_aneeq"]
             out.append({"month": m, "gross": s["net"] + s["aneeq_to_zuha"] - s["zuha_to_aneeq"],
                         "he_sent": s["aneeq_to_zuha"], "you_sent": s["zuha_to_aneeq"],
                         "due": max(0.0, s["net"] + s["aneeq_to_zuha"]), "due_by_section": due_month,
                         "net": bal - start, "absorbed": spend_extra, "start": start, "running": bal,
+                        "x2_total": total, "x2_his": his_x2, "x2_extra": extra_x2, "x2_pct": x2_pct,
                         "alloc": alloc, "skipped": s["skipped"]})
         return out
 
@@ -557,6 +573,18 @@ class Ledger:
                 break
             prev, cur = cur, r["running"]
         return cur, cur - prev
+
+    def proj_settle(self, p: dict) -> dict:
+        """Aneeq's side of one big expense: his share of its charges and what he paid on his own cards."""
+        share = direct = 0.0
+        for t in self.proj_stats(p)["txns"]:
+            zp = self.tx_z_share(t, p)
+            share += (1 - zp) * t["spend"]
+            pay = self.payer_of(t)
+            direct += t["spend"] if pay == "aneeq" else t["spend"] / 2 if pay == "shared" else 0.0
+        sent = sum(abs(t["spend"]) for t in self.txns
+                   if (self.proj_of(t) or {}).get("id") == p["id"] and (self.contrib_of(t) or {}).get("from") == "aneeq")
+        return {"share": share, "direct": direct, "sent": sent, "left": share - direct - sent}
 
     # ---------- Extras II fund ----------
     def fund_settings(self) -> dict:
