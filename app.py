@@ -195,7 +195,10 @@ def page_transactions(L: Ledger, m: str, person: str):
             status = "Line remembered · " + why
         else:
             status = why
-        if L.shifted(t):
+        orig = L.refund_matches().get(t["id"]) if t["spend"] < 0 else None
+        if orig:
+            status = f"Refund of the {orig['date']} charge · counts in {month_label(L.month_of(orig))} · " + status
+        elif L.shifted(t):
             status = f"Counts in {month_label(L.month_of(t))} (billed for next month) · " + status
         keep = {"Needs a person": not (who or ex or cb or pj), "All": True, "Big expenses": bool(pj and not cb),
                 "Money between you": bool(cb), "Not counted": ex}[show]
