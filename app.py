@@ -201,7 +201,7 @@ def page_transactions(L: Ledger, m: str, person: str):
                 "Money between you": bool(cb), "Not counted": ex}[show]
         if not keep or (q and q not in f"{t['desc']} {c} {t.get('account','')}".lower()):
             continue
-        line_val = proj_label.get(t.get("project")) if pj else ((t.get("for_line") or NO_LINE) if cb else c)
+        line_val = proj_label.get(pj["id"]) if pj else ((t.get("for_line") or NO_LINE) if cb else c)
         recs.append({"Date": t["date"], "Merchant": t["desc"], "Paid from": PAID_NAME.get(L.payer_of(t) or "", "⚪ not set"),
                      "Amount": t["spend"], "Line": line_val,
                      "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
@@ -240,13 +240,16 @@ def page_transactions(L: Ledger, m: str, person: str):
                     ch["project"] = label_proj[new["Line"]]
                     if cb:
                         ch["for_line"] = None
+                    elif remember:
+                        learn.setdefault(key, {})["project"] = label_proj[new["Line"]]
                 else:
-                    ch["project"] = None
+                    # "none" = taken off a big expense on purpose, even if a rule would match it
+                    ch["project"] = "none" if L.proj_of({**t, "project": None}) else None
                     ch["proj_item"] = None
                     if cb:
                         ch["for_line"] = new["Line"]
                     elif remember:
-                        learn.setdefault(key, {})["line"] = new["Line"]
+                        learn.setdefault(key, {}).update(line=new["Line"], project=None)
                         ch["cat_override"] = None
                     else:
                         ch["cat_override"] = new["Line"]
@@ -265,7 +268,7 @@ def page_transactions(L: Ledger, m: str, person: str):
             rules = fresh()[1].rules
             rules.setdefault("learn", {})
             for k, v in learn.items():
-                rules["learn"][k] = {**rules["learn"].get(k, {}), **v}
+                rules["learn"][k] = {kk: vv for kk, vv in {**rules["learn"].get(k, {}), **v}.items() if vv}
             save_config("rules", rules)
         if changes:
             update_txns(changes)
@@ -347,7 +350,7 @@ def page_unbudgeted(L: Ledger, m: str | None):
             rules = fresh()[1].rules
             rules.setdefault("learn", {})
             for k, v in learn.items():
-                rules["learn"][k] = {**rules["learn"].get(k, {}), **v}
+                rules["learn"][k] = {kk: vv for kk, vv in {**rules["learn"].get(k, {}), **v}.items() if vv}
             save_config("rules", rules)
         if changes:
             update_txns(changes)
@@ -650,12 +653,21 @@ def page_rules(L: Ledger, d: dict):
     lines = L.budget_lines()
     st.markdown("**Remembered merchants** (set from the Transactions page; these win over every other rule)")
     lrn = rules.get("learn") or {}
-    lrdf = pd.DataFrame([{"Merchant": k, "Line": v.get("line", ""), "Who": WHO_NAME.get(v.get("who"), "")} for k, v in sorted(lrn.items())],
+    lrdf = pd.DataFrame([{"Merchant": k, "Line": v.get("line", "") or ("★ " + pn) if (pn := {p["id"]: p["name"] for p in L.projects}.get(v.get("project"))) else v.get("line", ""),
+                          "Who": WHO_NAME.get(v.get("who"), "")} for k, v in sorted(lrn.items())],
                         columns=["Merchant", "Line", "Who"])
     lred = st.data_editor(lrdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-learn",
                           column_config={"Merchant": st.column_config.TextColumn(disabled=False),
-                                         "Line": st.column_config.SelectboxColumn(options=[""] + L.all_categories()),
+                                         "Line": st.column_config.SelectboxColumn(options=[""] + L.all_categories() + ["★ " + p["name"] for p in L.projects]),
                                          "Who": st.column_config.SelectboxColumn(options=WHO_OPTS)})
+
+    st.markdown("**Always counts toward a big expense** (descriptions matching this go to the big expense, even payments to PayPal)")
+    pnames = {p["id"]: p["name"] for p in L.projects}
+    prdf = pd.DataFrame([{"Description matches": x["match"], "Big expense": pnames.get(x["project"], "")} for x in L.proj_rules()],
+                        columns=["Description matches", "Big expense"])
+    pred = st.data_editor(prdf, hide_index=True, width="stretch", num_rows="dynamic", key="r-proj",
+                          column_config={"Description matches": st.column_config.TextColumn(help="Words from the description, e.g. wayfair; use | between alternatives"),
+                                         "Big expense": st.column_config.SelectboxColumn(options=list(pnames.values()))})
 
     st.markdown("**Billed for next month** (charges from these merchants on or after the given day count in the following month)")
     sdf = pd.DataFrame([{"Merchant contains": x["match"], "From day": int(x.get("from_day") or 20)} for x in L.shift_rules()],
@@ -714,13 +726,18 @@ def page_rules(L: Ledger, d: dict):
         r["deductions"] = [{"line": x["Line"], "who": WHO_KEY.get(x["Whose pay"] or "Zuha") or "zuha",
                             **({"amount": float(x["Amount"])} if x["Amount"] == x["Amount"] and x["Amount"] else {})}
                            for _, x in ded.iterrows() if x["Line"]]
+        name_id = {v: k for k, v in pnames.items()}
+        r["projrule"] = [{"match": str(x["Description matches"]).strip().lower(), "project": name_id[x["Big expense"]]}
+                         for _, x in pred.iterrows() if str(x["Description matches"] or "").strip() and x["Big expense"] in name_id]
         r["shift"] = [{"match": str(x["Merchant contains"]).strip().lower(), "from_day": int(x["From day"] or 20)}
                       for _, x in shed.iterrows() if str(x["Merchant contains"] or "").strip() and x["From day"] == x["From day"]]
         r["learn"] = {}
         for _, x in lred.iterrows():
             k = str(x["Merchant"] or "").strip().lower()
             if k and (x["Line"] or x["Who"]):
-                r["learn"][k] = {**({"line": x["Line"]} if x["Line"] else {}), **({"who": WHO_KEY[x["Who"]]} if x["Who"] else {})}
+                star = {"★ " + p["name"]: p["id"] for p in L.projects}
+                line = {"project": star[x["Line"]]} if x["Line"] in star else ({"line": x["Line"]} if x["Line"] else {})
+                r["learn"][k] = {**line, **({"who": WHO_KEY[x["Who"]]} if x["Who"] else {})}
         r["merchant"], r["recat"] = {}, {}
         for _, x in med.iterrows():
             k = str(x["Merchant"] or "").strip()
