@@ -594,8 +594,8 @@ def page_big(L: Ledger, m: str | None = None):
             st.rerun()
 
 
-def page_settle(L: Ledger):
-    html(ui.settle(L))
+def page_settle(L: Ledger, m: str | None = None):
+    html(ui.settle(L, m))
 
 
 # ---------------------------------------------------------------- bank sync (SimpleFIN)
@@ -1013,7 +1013,7 @@ def main():
     elif page == "Big expenses":
         page_big(L, m)
     elif page == "Settle up":
-        page_settle(L)
+        page_settle(L, m)
     elif not m:
         st.info("Add a statement on the Statements page to get started.")
     elif page == "Overview":
