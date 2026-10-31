@@ -217,6 +217,9 @@ class Ledger:
                     return r["cat"]
             except re.error:
                 continue
+        # Built-in: Blackbend payments are Haniya's school (only if that line exists; a remembered line still wins).
+        if re.search(r"black\s*bend", d) and "Haniya's School" in self.budget_lines():
+            return "Haniya's School"
         return None
 
     def learned(self, t: dict) -> dict:

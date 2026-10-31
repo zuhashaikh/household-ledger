@@ -118,6 +118,8 @@ def summary(L: Ledger, mo: str) -> str:
 def _state(spent: float, budget: float | None) -> str:
     if budget is None:
         return ""
+    if budget < 0:
+        return f'<span class="pill over">{m(spent - budget)} short</span>'
     if not budget:
         return '<span class="pill over">no budget</span>' if spent >= .5 else ""
     if spent > budget + .5:
@@ -133,19 +135,29 @@ def sections(L: Ledger, mo: str) -> str:
     zero = dict(zuha=0.0, aneeq=0.0, shared=0.0, unset=0.0)
     cols = ["zuha", "aneeq"] + [k for k in ("shared", "unset") if any(abs(r.get(k, 0)) >= .5 for r in rows.values())]
     out = []
+    # Extras II is a running fund: what's available this month is the fund balance carried in plus this month's budget.
+    budgets = dict(sm["budget"])
+    x2_why = ""
+    fr = next((r for r in L.fund(through=mo)["rows"] if r["month"] == mo), None)
+    if fr:
+        carried = fr["balance"] - fr["net"]
+        added = fr["x2"] + fr["leftover"] + fr["topups"]
+        budgets[DEFAULT_SECTION] = carried + added
+        if abs(carried) >= .5:
+            x2_why = f'{m(added)} this month {"+" if carried >= 0 else "−"} {m(abs(carried))} {"saved" if carried >= 0 else "already spent"} from earlier months'
 
-    def line(label, r, budget=None, cls=""):
+    def line(label, r, budget=None, cls="", why=""):
         r = r or zero
         tot = sum(r.get(k, 0) for k in cols)
         cells = "".join(f'<td class="r num" style="color:var(--{"muted" if k == "unset" else k})">{m(r.get(k, 0)) if abs(r.get(k, 0)) >= .5 else "–"}</td>' for k in cols)
-        bud = "" if budget is None else (m(budget) if budget else "–")
+        bud = "" if budget is None else ((m(budget) if budget else "–") + (f'<span class="why">{why}</span>' if why else ""))
         name = e(label) if cls else f"<b>{e(label)}</b>"
         out.append(f'<tr class="{cls}"><td>{name}</td>{cells}<td class="r num"><b>{m(tot)}</b></td><td class="r num">{bud}</td><td>{_state(tot, budget)}</td></tr>')
 
     for k, label in SECTIONS:
         reg, big = rows.get(k, zero), rows.get("big:" + k)
         both = {c: reg.get(c, 0) + (big or {}).get(c, 0) for c in zero}
-        line(label, both, sm["budget"].get(k, 0))
+        line(label, both, budgets.get(k, 0), why=x2_why if k == DEFAULT_SECTION else "")
         if big:
             line("regular spending", reg, cls="sub")
             for p in L.projects:
@@ -155,11 +167,13 @@ def sections(L: Ledger, mo: str) -> str:
         line("Not in the budget", rows["other"])
     allr = {c: sum(r.get(c, 0) for key, r in rows.items() if not key.startswith("proj:")) for c in zero}
     tot = sum(allr[c] for c in cols)
-    btot = sum(sm["budget"].get(k, 0) for k, _ in SECTIONS)
+    btot = sum(budgets.get(k, 0) for k, _ in SECTIONS)
     out.append(f'<tr class="tot"><td>Total</td>{"".join(f"<td class=r>{m(allr[c])}</td>" for c in cols)}<td class="r num">{m(tot)}</td><td class="r num">{m(btot) if btot else "–"}</td><td></td></tr>')
     head = "".join(f'<th class="r">{e(PAYER_LABEL[k])}</th>' for k in cols)
     note = ('Big expenses count under Extras II in the month they&#39;re charged. Extras II works as a running fund: '
-            'what isn&#39;t spent carries forward, and leftover Core and Extras I money is added once a month is closed.')
+            'what isn&#39;t spent carries forward, and leftover Core and Extras I money is added once a month is closed. '
+            'So the Extras II budget shown here is what&#39;s really available this month: this month&#39;s Extras II budget plus the fund '
+            'balance from earlier months (less, if earlier months already spent into it).')
     return (f'<div class="lg-h2">By section and account, {e(month_label(mo))}</div>'
             f'<div class="lg-scroll"><table class="lg-table"><thead><tr><th>Section</th>{head}<th class="r">Total</th><th class="r">Budget</th><th></th></tr></thead>'
             f'<tbody>{"".join(out)}</tbody></table></div><p class="lg-note">{note}</p>')
@@ -307,6 +321,16 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
                 f'<span class="lg-muted">({m(r["x2_his"], True)} of {m(r["x2_total"], True)} in {e(month_label(r["month"]))})</span>')
     sent = f'He sent {m(r["he_sent"], True)}' + (f' and had {m(-r["start"], True)} credit from earlier' if r["start"] <= -1 else "")
     ab = f' {m(r["absorbed"], True)} of his own extra spending was absorbed.' if r["absorbed"] >= 1 else ""
+    his_for_her = [t for t in L.month_txns(r["month"], with_deductions=False)
+                   if L.payer_of(t) == "aneeq" and not L.contrib_of(t) and not L.proj_of(t)
+                   and not L.is_excluded(L.cat_of(t)) and L.resolve(t)[0] in ("zuha", "shared")]
+    hf_rows = "".join(f'<tr><td class="num lg-muted" style="white-space:nowrap">{e(t["date"])}</td><td><b>{e(t["desc"])}</b><span class="why">{e(t.get("account", ""))}</span></td>'
+                      f'<td>{e(L.cat_of(t))} · {"Zuha" if L.resolve(t)[0] == "zuha" else "shared, Zuha&#39;s half"}</td>'
+                      f'<td class="r num">{m(t["spend"] if L.resolve(t)[0] == "zuha" else t["spend"] / 2, True)}</td></tr>'
+                      for t in sorted(his_for_her, key=lambda t: t["date"]))
+    hf_html = (f'<div class="lg-eyebrow" style="margin:14px 0 6px">Aneeq paid for Zuha&#39;s share in {e(month_label(r["month"]))}</div>'
+               f'<div class="lg-scroll"><table class="lg-table"><tbody>{hf_rows}</tbody></table></div>'
+               '<p class="lg-note">These count in the “Covered by his own spending” column above: they reduce what he owes.</p>') if hf_rows else ""
     tx = L.transfers(r["month"])
     DIR_LABEL = {"aneeq": '<span class="dot d-aneeq"></span>Aneeq to Zuha', "zuha": '<span class="dot d-zuha"></span>Zuha to Aneeq'}
     tx_rows = "".join(f'<tr><td class="num lg-muted" style="white-space:nowrap">{e(t["date"])}</td><td><b>{e(t["desc"])}</b><span class="why">{e(t.get("account", ""))}</span></td>'
@@ -323,7 +347,7 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
             '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>In order</th><th class="r">He owed</th>'
             '<th class="r">Covered by his own spending</th><th class="r">Paid from money he sent</th><th class="r">Still owed</th></tr></thead>'
             f'<tbody>{"".join(trs) or "<tr><td colspan=5 class=lg-muted>Nothing owed this month.</td></tr>"}'
-            f'<tr class="tot"><td colspan="5">{end}</td></tr></tbody></table></div>' + tx_html)
+            f'<tr class="tot"><td colspan="5">{end}</td></tr></tbody></table></div>' + hf_html + tx_html)
 
 
 def person_budget(L: Ledger, mo: str, who: str) -> str:
