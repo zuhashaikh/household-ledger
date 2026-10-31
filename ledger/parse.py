@@ -69,7 +69,7 @@ def _amount(v) -> float | None:
 def read_statement(pdf: bytes, ledger: Ledger, api_key: str, model: str) -> dict:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=300)
     content = [
         {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
                                          "data": base64.standard_b64encode(pdf).decode()}},
@@ -142,7 +142,7 @@ def categorize(rows: list[dict], ledger: Ledger, api_key: str, model: str) -> li
     known = p.split("(follow these):\n", 1)[1].split("\n- Known accounts", 1)[0] if "(follow these):\n" in p else "(none yet)"
     catmap = "; ".join(f"{k} → {v}" for k, v in (ledger.rules.get("catmap") or {}).items()) or "(none)"
     listing = "\n".join(f"{i}. {r['desc']} | {r['amt']:.2f} | {r['account']}" for i, r in enumerate(rows))
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=120, max_retries=1)
     msg = client.messages.create(model=model, max_tokens=8000, messages=[{"role": "user", "content": CATEGORIZE.format(
         lines=json.dumps(ledger.budget_lines()), catmap=catmap, known=known, rows=listing)}])
     text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")

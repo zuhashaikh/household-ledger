@@ -50,7 +50,7 @@ def _split(access_url: str) -> tuple[str, tuple[str, str]]:
 def fetch(access_url: str, start: float, end: float) -> dict:
     base, auth = _split(access_url)
     r = requests.get(base + "/accounts", params={"start-date": int(start), "end-date": int(end), "version": 2},
-                     auth=auth, timeout=90)
+                     auth=auth, timeout=45)
     if r.status_code == 402:
         raise FeedError("SimpleFIN needs payment before it will share data. Check your SimpleFIN subscription.")
     if r.status_code == 403:
