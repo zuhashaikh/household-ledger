@@ -89,7 +89,7 @@ def load_data(_store, version: int) -> dict:
 def ledger_from(d: dict) -> Ledger:
     cfg = d["config"]
     return Ledger(rules=cfg.get("rules") or {}, plan=cfg.get("plan") or {"budgets": {}, "byMonth": {}, "groups": {}},
-                  projects=cfg.get("projects") or [], txns=d["txns"])
+                  projects=cfg.get("projects") or [], txns=d["txns"], fund_cfg=cfg.get("fund") or {})
 
 
 def bump():
@@ -106,6 +106,62 @@ def fresh() -> tuple[dict, Ledger]:
 def save_config(key: str, value):
     get_store().save_config(key, value)
     bump()
+
+
+DROP = object()  # marks a remembered field to forget
+
+
+def remember_choices(learn: dict[str, dict], m: str) -> int:
+    """Save remembered merchant choices (line / who / big expense). A new choice applies to every month; changing or
+    forgetting an existing one only applies from month m on: earlier months keep what they had. Returns charges affected."""
+    d, LL = fresh()
+    rules = LL.rules
+    rules.setdefault("learn", {})
+    pinned: dict[str, dict] = {}
+    for key, upd in learn.items():
+        old = dict(rules["learn"].get(key) or {})
+        changing = {f for f, v in upd.items() if f in old and (v is DROP or v != old[f])}
+        if changing:
+            for t in LL.txns:
+                if learn_key(t.get("desc", "")) != key or LL.month_of(t) >= m:
+                    continue
+                pin = {}
+                if {"line", "project"} & changing and not t.get("cat_override") and not t.get("project"):
+                    pj = LL.proj_of(t)
+                    if pj and old.get("project"):
+                        pin["project"] = pj["id"]
+                    elif old.get("line"):
+                        pin["cat_override"] = LL.cat_of(t)
+                if "who" in changing and not t.get("person") and old.get("who"):
+                    pin["person"] = old["who"]
+                if pin:
+                    pinned.setdefault(t["id"], {}).update(pin)
+        new = {**old}
+        for f, v in upd.items():
+            if v is DROP or v in (None, ""):
+                new.pop(f, None)
+            else:
+                new[f] = v
+        if new:
+            rules["learn"][key] = new
+        else:
+            rules["learn"].pop(key, None)
+    get_store().save_config("rules", rules)
+    if pinned:
+        for t in d["txns"]:
+            if t["id"] in pinned:
+                t.update(pinned[t["id"]])
+        get_store().save_txns(d["txns"])
+    bump()
+    return sum(1 for t in LL.txns if learn_key(t.get("desc", "")) in learn and LL.month_of(t) >= m)
+
+
+def keep_past_plans(plan: dict, months_with_data: list[str], m: str):
+    """Before changing the standard plan from month m on, give earlier months that used it their own copy,
+    so their budgets don't change after the fact."""
+    for k in months_with_data:
+        if k < m and k not in plan["byMonth"]:
+            plan["byMonth"][k] = dict(plan["budgets"])
 
 
 def update_txns(changes: dict[str, dict]):
@@ -125,44 +181,124 @@ def html(x: str):
     st.markdown(x, unsafe_allow_html=True)
 
 
+def close_month_toggle(L: Ledger, m: str, key: str):
+    fs = L.fund_settings()
+    closed = m in fs["closed"]
+    val = st.checkbox(f"All of {month_label(m)}'s statements are in: count its Core and Extras I leftover toward the Extras II fund",
+                      value=closed, key=key)
+    if val != closed:
+        f = fresh()[1].fund_settings()
+        f["closed"] = sorted(set(f["closed"]) | {m}) if val else [x for x in f["closed"] if x != m]
+        save_config("fund", f)
+        st.rerun()
+
+
 def page_overview(L: Ledger, m: str):
     html(ui.summary(L, m))
     html(ui.sections(L, m))
+    html('<div class="lg-h2">Extras II fund</div>')
+    html(ui.fund_panel(L, m, compact=True))
+    close_month_toggle(L, m, f"close-ov-{m}")
 
 
-def page_budget(L: Ledger, m: str):
+def page_budget(L: Ledger, m: str, person: str = "zuha"):
+    html(f'<div class="lg-h2" style="margin-top:4px">Budget check by person, {ui.e(month_label(m))}</div>')
+    names = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}
+    who_label = st.segmented_control("Person", list(names.values()), default=names.get(person, names["zuha"]),
+                                     key="budget-person", label_visibility="collapsed") or names.get(person, names["zuha"])
+    who = next(k for k, v in names.items() if v == who_label)
+    html(ui.person_budget(L, m, who))
     html(ui.budget(L, m))
     own = m in L.plan["byMonth"]
     rows = L.budget_rows(m)
-    exp = st.expander("Edit budget amounts")
-    exp.caption((f"{month_label(m)} has its own plan from your budget sheet; edits apply to this month only."
-                 if own else "This month uses your standard plan; edits apply to every month that uses it."))
+    SEC_LABEL = {k: l for k, l in SECTIONS}
+    SEC_KEY = {l: k for k, l in SECTIONS}
+    NOT_ON = "Not in the budget"
+
+    exp = st.expander("Edit budget lines: amount, section, whose")
+    exp.caption((f"{month_label(m)} has its own plan from your budget sheet; amount changes apply to this month only."
+                 if own else f"This month uses your standard plan; amount changes apply from {month_label(m)} on. Earlier months keep their budgets.")
+                + " Section and whose apply to every month. Set an amount to 0 to take a line off this month's budget.")
     df = pd.DataFrame([{
-        "Section": r["section"], "Line": r["cat"], "Whose": WHO_NAME.get(r["owner"], "") if r["owner"] else "",
-        "Budget": r["planned"], "Set aside": r["set_aside"] or None, "Spent": r["all"],
-        "Zuha": r["zuha"], "Aneeq": r["aneeq"], "Shared": r["shared"], "Not assigned": r["none"],
-        "Left": r["left"] if r["available"] or r["set_aside"] else None,
-    } for r in rows])
-    if df.empty:
-        return
-    mc = {c: st.column_config.NumberColumn(c, format="$%.0f", disabled=c != "Budget")
-          for c in ["Budget", "Set aside", "Spent", "Zuha", "Aneeq", "Shared", "Not assigned", "Left"]}
-    edited = exp.data_editor(df[["Section", "Line", "Whose", "Budget", "Set aside", "Spent"]], hide_index=True, width="stretch", key=f"bud-{m}",
-                            column_config={**mc, "Section": st.column_config.TextColumn(disabled=True),
-                                           "Line": st.column_config.TextColumn(disabled=True),
-                                           "Whose": st.column_config.TextColumn(disabled=True)})
-    if exp.button("Save budget changes", type="primary"):
-        plan = fresh()[1].plan
-        tgt = plan["byMonth"][m] if own else plan["budgets"]
-        for _, r in edited.iterrows():
-            v = float(r["Budget"] or 0)
-            if v:
-                tgt[r["Line"]] = v
+        "Section": SEC_LABEL.get(L.plan["groups"].get(r["cat"]), NOT_ON), "Line": r["cat"],
+        "Whose": WHO_NAME.get(r["owner"], "") if r["owner"] else "", "Budget": r["planned"], "Spent": r["all"],
+    } for r in rows], columns=["Section", "Line", "Whose", "Budget", "Spent"])
+    if not df.empty:
+        edited = exp.data_editor(df, hide_index=True, width="stretch", key=f"bud-{m}",
+                                 column_config={"Section": st.column_config.SelectboxColumn(options=[l for _, l in SECTIONS] + [NOT_ON]),
+                                                "Line": st.column_config.TextColumn(disabled=True),
+                                                "Whose": st.column_config.SelectboxColumn(options=WHO_OPTS),
+                                                "Budget": st.column_config.NumberColumn(format="$%.0f", min_value=0),
+                                                "Spent": st.column_config.NumberColumn(format="$%.0f", disabled=True)})
+        if exp.button("Save budget changes", type="primary", key="bud-save"):
+            _, LL = fresh()
+            plan, rules = LL.plan, LL.rules
+            if not own:
+                keep_past_plans(plan, LL.months(), m)
+            tgt = plan["byMonth"][m] if own else plan["budgets"]
+            for _, r in edited.iterrows():
+                line = r["Line"]
+                v = float(r["Budget"] or 0)
+                if v:
+                    tgt[line] = v
+                else:
+                    tgt.pop(line, None)
+                if r["Section"] in SEC_KEY:
+                    plan["groups"][line] = SEC_KEY[r["Section"]]
+                else:
+                    plan["groups"].pop(line, None)
+                who = WHO_KEY.get(r["Whose"] or "")
+                if who:
+                    rules["category"][line] = who
+                else:
+                    rules["category"].pop(line, None)
+            save_config("plan", plan)
+            save_config("rules", rules)
+            st.session_state["bud-flash"] = "Budget saved."
+            st.rerun()
+
+    with st.expander("＋ Add a budget line"):
+        with st.form("add-line", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Name", placeholder="e.g. Gym, Car maintenance, Gifts")
+            amt = c2.number_input("Monthly amount", min_value=0.0, step=25.0, format="%.2f")
+            c3, c4, c5 = st.columns(3)
+            sec = c3.selectbox("Section", [l for _, l in SECTIONS], index=0)
+            whose = c4.selectbox("Whose", ["🟡 Shared (50:50)", "🟣 Zuha", "🔵 Aneeq"], index=0,
+                                 help="Extras II lines are shared; Core and Extras I lines usually belong to one of you")
+            when = c5.selectbox("Applies", [f"From {month_label(m)} on", f"Only {month_label(m)}"])
+            ok = st.form_submit_button("Add line", type="primary")
+        if ok:
+            name = name.strip()
+            existing = {x.lower() for x in L.budget_lines()} | {x.lower() for x in L.plan["groups"]}
+            if not name:
+                st.error("Give the line a name.")
+            elif name.lower() in existing:
+                st.error(f"There's already a line called “{name}”. Change its amount in Edit budget lines instead.")
+            elif L.is_excluded(name):
+                st.error("That name looks like a transfer or payment, which isn't counted as spending. Pick another name.")
             else:
-                tgt.pop(r["Line"], None)
-        save_config("plan", plan)
-        st.success("Budget saved.")
-        st.rerun()
+                _, LL = fresh()
+                plan, rules = LL.plan, LL.rules
+                if when.startswith("Only"):
+                    if m not in plan["byMonth"]:
+                        plan["byMonth"][m] = dict(plan["budgets"])
+                    plan["byMonth"][m][name] = float(amt)
+                else:
+                    keep_past_plans(plan, LL.months(), m)
+                    plan["budgets"][name] = float(amt)
+                    for k in plan["byMonth"]:
+                        if k >= m:
+                            plan["byMonth"][k][name] = float(amt)
+                plan["groups"][name] = SEC_KEY[sec]
+                rules["category"][name] = {"🟡 Shared (50:50)": "shared", "🟣 Zuha": "zuha", "🔵 Aneeq": "aneeq"}[whose]
+                save_config("plan", plan)
+                save_config("rules", rules)
+                st.session_state["bud-flash"] = (f"Added “{name}” ({ui.m(amt)}/month, {sec}). Charges can be put on it from the "
+                                                 "Transactions or Not in budget tab.")
+                st.rerun()
+    if st.session_state.get("bud-flash"):
+        st.success(st.session_state.pop("bud-flash"))
 
 
 def page_transactions(L: Ledger, m: str, person: str):
@@ -208,7 +344,7 @@ def page_transactions(L: Ledger, m: str, person: str):
         recs.append({"Date": t["date"], "Merchant": t["desc"], "Paid from": PAID_NAME.get(L.payer_of(t) or "", "⚪ not set"),
                      "Amount": t["spend"], "Line": line_val,
                      "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
-                     "Item": t.get("proj_item") or NO_ITEM, "Status": status})
+                     "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False, "Status": status})
         ids.append(t["id"])
     if not recs:
         st.info("Nothing here.")
@@ -226,9 +362,11 @@ def page_transactions(L: Ledger, m: str, person: str):
             "Line": st.column_config.SelectboxColumn(options=line_opts, help="Budget line, or ★ a big expense"),
             "Who": st.column_config.SelectboxColumn(options=[UNSET] + WHO_OPTS[1:] + [NO_ITEM], help="Whose budget this counts toward"),
             "Item": st.column_config.SelectboxColumn(options=[NO_ITEM] + items, help="Big-expense item"),
+            "Only this charge": st.column_config.CheckboxColumn(help="Tick to change just this charge. Otherwise the choice is remembered for the merchant from now on."),
             "Status": st.column_config.TextColumn(disabled=True)})
-    remember = st.checkbox("Remember these choices for the same merchant: apply to every month and to future statements",
-                           value=True, key="remember")
+    html('<p class="lg-note" style="margin:6px 0">Changes are remembered for the merchant: this month, later months and future statements. '
+         'Earlier months keep what they had. To forget a remembered choice, set Line to — or Who to ⚪ Not set. '
+         'Tick <b>Only this charge</b> for a one-off exception.</p>')
     if st.button("Save changes", type="primary", key="save-tx"):
         changes: dict[str, dict] = {}
         learn: dict[str, dict] = {}
@@ -238,48 +376,56 @@ def page_transactions(L: Ledger, m: str, person: str):
             ch = {}
             cb = L.contrib_of(t)
             key = learn_key(t["desc"])
-            if new["Line"] != old["Line"] and new["Line"] and new["Line"] != NO_LINE:
-                if new["Line"] in label_proj:
-                    ch["project"] = label_proj[new["Line"]]
+            once = bool(new.get("Only this charge"))
+            if new["Line"] != old["Line"] and new["Line"]:
+                if new["Line"] == NO_LINE:
                     if cb:
                         ch["for_line"] = None
-                    elif remember:
-                        learn.setdefault(key, {})["project"] = label_proj[new["Line"]]
+                    elif once:
+                        ch["cat_override"] = None
+                        ch["project"] = None
+                    else:
+                        learn.setdefault(key, {}).update(line=DROP, project=DROP)
+                        ch["cat_override"] = None
+                        ch["project"] = None
+                elif new["Line"] in label_proj:
+                    if cb or once:
+                        ch["project"] = label_proj[new["Line"]]
+                        if cb:
+                            ch["for_line"] = None
+                    else:
+                        learn.setdefault(key, {}).update(project=label_proj[new["Line"]], line=DROP)
+                        ch["project"] = None
+                        ch["cat_override"] = None
                 else:
-                    # "none" = taken off a big expense on purpose, even if a rule would match it
-                    ch["project"] = "none" if L.proj_of({**t, "project": None}) else None
                     ch["proj_item"] = None
                     if cb:
                         ch["for_line"] = new["Line"]
-                    elif remember:
-                        learn.setdefault(key, {}).update(line=new["Line"], project=None)
-                        ch["cat_override"] = None
-                    else:
+                    elif once:
                         ch["cat_override"] = new["Line"]
+                        ch["project"] = "none" if L.proj_of({**t, "project": None}) else None
+                    else:
+                        learn.setdefault(key, {}).update(line=new["Line"], project=DROP)
+                        ch["cat_override"] = None
+                        ch["project"] = None
             if new["Who"] != old["Who"] and not cb and new["Who"] != NO_ITEM:
                 who = WHO_KEY.get(new["Who"] or "") if new["Who"] != UNSET else None
-                if remember and who:
-                    learn.setdefault(key, {})["who"] = who
-                    ch["person"] = None
-                else:
+                if once:
                     ch["person"] = who
+                else:
+                    learn.setdefault(key, {})["who"] = who if who else DROP
+                    ch["person"] = None
             if (new["Item"] or NO_ITEM) != (old["Item"] or NO_ITEM):
                 ch["proj_item"] = None if new["Item"] in (None, "", NO_ITEM) else new["Item"]
             if ch:
                 changes[t["id"]] = ch
-        if learn:
-            rules = fresh()[1].rules
-            rules.setdefault("learn", {})
-            for k, v in learn.items():
-                rules["learn"][k] = {kk: vv for kk, vv in {**rules["learn"].get(k, {}), **v}.items() if vv}
-            save_config("rules", rules)
         if changes:
             update_txns(changes)
+        n = remember_choices(learn, m) if learn else 0
         if learn or changes:
-            n = sum(1 for t in L.txns if learn_key(t["desc"]) in learn)
-            st.session_state["flash"] = (f"Saved. Remembered {len(learn)} merchant{'s' if len(learn) != 1 else ''}, "
-                                         f"applied to {n} charge{'s' if n != 1 else ''} across all months and to future statements."
-                                         if learn else f"Saved {len(changes)} change{'s' if len(changes) != 1 else ''}.")
+            st.session_state["flash"] = (f"Saved. Remembered choices updated for {len(learn)} merchant{'s' if len(learn) != 1 else ''}; "
+                                         "they apply to future statements too."
+                                         if learn else f"Saved {len(changes)} change{'s' if len(changes) != 1 else ''} to just those charges.")
             st.rerun()
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
@@ -325,7 +471,7 @@ def page_unbudgeted(L: Ledger, m: str | None):
     KEEP = "— keep as is —"
     df = pd.DataFrame([{"Date": t["date"], "Merchant": t["desc"], "Amount": t["spend"],
                         "Paid from": PAID_NAME.get(L.payer_of(t) or "", UNSET), "Account": t.get("account", ""),
-                        "Category now": c, "Assign to": KEEP} for t, c in rows])
+                        "Category now": c, "Assign to": KEEP, "Only this charge": False} for t, c in rows])
     ids = [t["id"] for t, _ in rows]
     ed = st.data_editor(df, hide_index=True, width="stretch", key=f"nib-{scope}-{m}",
                         column_config={"Date": st.column_config.TextColumn(disabled=True, width="small"),
@@ -334,8 +480,10 @@ def page_unbudgeted(L: Ledger, m: str | None):
                                        "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
                                        "Account": st.column_config.TextColumn(disabled=True),
                                        "Category now": st.column_config.TextColumn(disabled=True),
-                                       "Assign to": st.column_config.SelectboxColumn(options=[KEEP] + budget_lines, help="A line from your budget sheet")})
-    remember = st.checkbox("Remember for the same merchant: apply to every month and to future statements", value=True, key="nib-remember")
+                                       "Assign to": st.column_config.SelectboxColumn(options=[KEEP] + budget_lines, help="A line from your budget sheet"),
+                                       "Only this charge": st.column_config.CheckboxColumn(help="Tick for a one-off. Otherwise it's remembered for the merchant.")})
+    html('<p class="lg-note" style="margin:6px 0">Assignments are remembered for the merchant from this month on and for future statements; '
+         'earlier months keep what they had. Tick <b>Only this charge</b> for a one-off.</p>')
     if st.button("Save assignments", type="primary", key="nib-save"):
         byid = {t["id"]: t for t in L.txns}
         learn, changes = {}, {}
@@ -343,31 +491,60 @@ def page_unbudgeted(L: Ledger, m: str | None):
             if r["Assign to"] in (None, "", KEEP):
                 continue
             t = byid[ids[i]]
-            if remember:
-                learn.setdefault(learn_key(t["desc"]), {})["line"] = r["Assign to"]
+            if bool(r.get("Only this charge")):
+                changes[t["id"]] = {"cat_override": r["Assign to"]}
+            else:
+                learn.setdefault(learn_key(t["desc"]), {}).update(line=r["Assign to"], project=DROP)
                 if t.get("cat_override"):
                     changes[t["id"]] = {"cat_override": None}
-            else:
-                changes[t["id"]] = {"cat_override": r["Assign to"]}
-        if learn:
-            rules = fresh()[1].rules
-            rules.setdefault("learn", {})
-            for k, v in learn.items():
-                rules["learn"][k] = {kk: vv for kk, vv in {**rules["learn"].get(k, {}), **v}.items() if vv}
-            save_config("rules", rules)
         if changes:
             update_txns(changes)
+        start = m if (m and scope != "All months") else (min(L.months()) if L.months() else "0000-00")
+        n = remember_choices(learn, start) if learn else 0
         if learn or changes:
-            n = sum(1 for t in L.txns if learn_key(t["desc"]) in learn) if learn else len(changes)
-            st.session_state["nib-flash"] = f"Assigned {n} charge{'s' if n != 1 else ''}" + (" and remembered for next time." if learn else ".")
+            st.session_state["nib-flash"] = (f"Assigned and remembered for {len(learn)} merchant{'s' if len(learn) != 1 else ''}; future statements will follow it."
+                                             if learn else f"Assigned {len(changes)} charge{'s' if len(changes) != 1 else ''}.")
             st.rerun()
     if st.session_state.get("nib-flash"):
         st.success(st.session_state.pop("nib-flash"))
 
 
-def page_big(L: Ledger):
-    html('<div class="lg-h2" style="margin-top:4px">Big expenses</div><p class="lg-note" style="margin:0 0 12px">One-off costs paid for by budget set aside '
-         'from regular lines (usually Household Goods + Trips in Extras II). Tag a charge to one from Transactions by choosing ★ in the Line column.</p>')
+def page_big(L: Ledger, m: str | None = None):
+    html('<div class="lg-h2" style="margin-top:4px">Extras II fund</div><p class="lg-note" style="margin:0 0 10px">Each month the fund gets that month&#39;s '
+         'Extras II budget, plus whatever was left on Core and Extras I once the month is closed. Everyday Extras II spending and big expenses '
+         'come out of it. Unspent money stays in the fund; a negative balance is paid back by future months.</p>')
+    html(ui.fund_panel(L, m))
+    if m:
+        close_month_toggle(L, m, f"close-big-{m}")
+    with st.expander("Fund settings: start, top-ups, closed months"):
+        fs = L.fund_settings()
+        c1, c2 = st.columns(2)
+        start = c1.text_input("Fund starts (YYYY-MM)", value=fs["start"], key="f-start")
+        opening = c2.number_input("Balance at the start", value=float(fs["opening"] or 0), step=50.0, key="f-open")
+        st.markdown("**Top-ups** (money put into the fund from outside the monthly budget, e.g. Aneeq's Roth). Leave Month blank for planned ones; they count in the outlook only.")
+        tdf = pd.DataFrame([{"Month": t.get("month") or "", "Whose money": {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}.get(t.get("who"), ""),
+                             "Amount": float(t.get("amount") or 0), "Note": t.get("note", "")} for t in fs["topups"]],
+                           columns=["Month", "Whose money", "Amount", "Note"])
+        ted = st.data_editor(tdf, hide_index=True, width="stretch", num_rows="dynamic", key="f-tops",
+                             column_config={"Month": st.column_config.TextColumn(help="YYYY-MM, or blank if not yet received"),
+                                            "Whose money": st.column_config.SelectboxColumn(options=["🟣 Zuha", "🔵 Aneeq"]),
+                                            "Amount": st.column_config.NumberColumn(format="$%.2f")})
+        closed = st.multiselect("Closed months (all statements in)", L.months(), default=[x for x in fs["closed"] if x in L.months()],
+                                format_func=month_label, key="f-closed")
+        if st.button("Save fund settings", type="primary", key="f-save"):
+            import re as _re
+            if not _re.fullmatch(r"\d{4}-\d{2}", start.strip()):
+                st.error("Start month must look like 2026-09.")
+            else:
+                save_config("fund", {"start": start.strip(), "opening": float(opening or 0), "closed": sorted(closed),
+                                     "topups": [{"month": str(r["Month"] or "").strip(), "who": {"🟣 Zuha": "zuha", "🔵 Aneeq": "aneeq"}.get(r["Whose money"]),
+                                                 "amount": float(r["Amount"] or 0), "note": str(r["Note"] or "")}
+                                                for _, r in ted.iterrows() if float(r["Amount"] or 0)]})
+                st.success("Saved.")
+                st.rerun()
+
+    html('<div class="lg-h2">Big expenses</div><p class="lg-note" style="margin:0 0 12px">Paid from the Extras II fund and split 50:50 unless you change it. '
+         'Tag a charge to one from Transactions by choosing ★ in the Line column.</p>')
     for p in L.projects:
         stt = L.proj_stats(p)
         html(ui.big_card(L, p))
@@ -380,10 +557,12 @@ def page_big(L: Ledger):
                                 column_config={"Whose": st.column_config.SelectboxColumn(options=WHO_OPTS, help="Blank = project split"),
                                                "Estimated": st.column_config.NumberColumn(format="$%.0f")})
 
-            c1, c2 = st.columns(2)
-            split_opts = {"By funding plan": "", "50:50": "even", "All Zuha": "zuha", "All Aneeq": "aneeq"}
-            split = c1.selectbox(f"Settle-up split (funding plan = {stt['plan_pct']*100:.0f}% Zuha)", list(split_opts),
-                                 index=list(split_opts.values()).index(p.get("split") or ""), key=f"split-{p['id']}")
+            c1, c2, c3 = st.columns(3)
+            split_opts = {"50:50": "even", "Custom": "custom", "All Zuha": "zuha", "All Aneeq": "aneeq"}
+            cur_split = p.get("split") if p.get("split") in split_opts.values() else "even"
+            split = c1.selectbox("Split", list(split_opts), index=list(split_opts.values()).index(cur_split), key=f"split-{p['id']}")
+            zpct = c3.number_input("Zuha's share %", min_value=0, max_value=100, value=int(float(p.get("zuha_pct") or 50)),
+                                   key=f"zpct-{p['id']}", disabled=split_opts[split] != "custom")
             sec_names = [l for _, l in SECTIONS]
             cur = next((l for k, l in SECTIONS if k == (p.get("section") or DEFAULT_SECTION)), "Extras II")
             sec = c2.selectbox("Counts under", sec_names, index=sec_names.index(cur), key=f"sec-{p['id']}")
@@ -393,10 +572,11 @@ def page_big(L: Ledger):
                 tgt["items"] = [{"name": str(r["Item"]), "est": float(r["Estimated"] or 0),
                                  **({"who": WHO_KEY[r["Whose"]]} if r.get("Whose") else {})}
                                 for _, r in ed.iterrows() if str(r["Item"] or "").strip()]
-                if split_opts[split]:
-                    tgt["split"] = split_opts[split]
+                tgt["split"] = split_opts[split]
+                if split_opts[split] == "custom":
+                    tgt["zuha_pct"] = int(zpct)
                 else:
-                    tgt.pop("split", None)
+                    tgt.pop("zuha_pct", None)
                 tgt["section"] = next(k for k, l in SECTIONS if l == sec)
                 save_config("projects", projects)
                 st.success("Saved.")
@@ -654,7 +834,8 @@ def page_rules(L: Ledger, d: dict):
                          column_config={"From": st.column_config.SelectboxColumn(options=["Aneeq", "Zuha"])})
 
     lines = L.budget_lines()
-    st.markdown("**Remembered merchants** (set from the Transactions page; these win over every other rule)")
+    st.markdown("**Remembered merchants** (set from the Transactions or Not in budget tab; these win over every other rule). "
+                "Removing one here forgets it for every month; to stop it only from a month on, set its Line to — on Transactions.")
     lrn = rules.get("learn") or {}
     lrdf = pd.DataFrame([{"Merchant": k, "Line": v.get("line", "") or ("★ " + pn) if (pn := {p["id"]: p["name"] for p in L.projects}.get(v.get("project"))) else v.get("line", ""),
                           "Who": WHO_NAME.get(v.get("who"), "")} for k, v in sorted(lrn.items())],
@@ -830,7 +1011,7 @@ def main():
     elif page == "Rules":
         page_rules(L, d)
     elif page == "Big expenses":
-        page_big(L)
+        page_big(L, m)
     elif page == "Settle up":
         page_settle(L)
     elif not m:
@@ -838,7 +1019,7 @@ def main():
     elif page == "Overview":
         page_overview(L, m)
     elif page == "Budget":
-        page_budget(L, m)
+        page_budget(L, m, person)
     elif page == "Not in budget":
         page_unbudgeted(L, m)
     elif page == "Transactions":
