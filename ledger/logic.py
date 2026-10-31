@@ -93,8 +93,32 @@ class Ledger:
         self.plan.setdefault("groups", {})
 
     # ---------- lookups ----------
+    def shift_rules(self) -> list[dict]:
+        """Merchants that bill at the end of a month for the next one (e.g. Ota Swim): charges on or after
+        `from_day` count toward the following month."""
+        r = self.rules.get("shift")
+        if r is None:
+            r = [{"match": "ota scuba swim", "from_day": 20, "label": "Ota Swim"}]
+        return [x for x in r if x and x.get("match")]
+
+    def month_of(self, t: dict) -> str:
+        """The month a charge counts in: its own month, unless it was moved by hand or a next-month rule applies."""
+        if t.get("moved_from") or t.get("synthetic"):
+            return t["month"]
+        d = str(t.get("date") or "")
+        base = d[:7] or t.get("month", "")
+        key = learn_key(t.get("desc", ""))
+        for x in self.shift_rules():
+            if str(x["match"]).lower() in key and len(d) >= 10 and int(d[8:10]) >= int(x.get("from_day") or 20):
+                y, mo = int(base[:4]), int(base[5:7]) + 1
+                return f"{y + (mo > 12)}-{(mo - 1) % 12 + 1:02d}"
+        return base
+
+    def shifted(self, t: dict) -> bool:
+        return not t.get("moved_from") and not t.get("synthetic") and self.month_of(t) != str(t.get("date", ""))[:7]
+
     def months(self) -> list[str]:
-        return sorted({t["month"] for t in self.txns})
+        return sorted({self.month_of(t) for t in self.txns})
 
     def deductions(self) -> list[dict]:
         """Budget lines paid straight out of someone's paycheck, so they never appear on a statement.
@@ -117,7 +141,7 @@ class Ledger:
         return out
 
     def month_txns(self, m: str, with_deductions: bool = True) -> list[dict]:
-        own = [t for t in self.txns if t.get("month") == m]
+        own = [t for t in self.txns if self.month_of(t) == m]
         return own + (self.deduction_txns(m) if with_deductions and own else [])
 
     def plan_for(self, m: str) -> dict:
