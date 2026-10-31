@@ -64,6 +64,14 @@ h1,h2,h3{font-family:var(--display)!important;letter-spacing:-.01em;color:var(--
 .lg-stats .v{font-family:var(--display);font-size:22px;font-weight:700;color:var(--ink)}
 .lg-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 @media (max-width:820px){.lg-cols{grid-template-columns:1fr}}
+.lg-two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0 4px}
+@media (max-width:820px){.lg-two{grid-template-columns:1fr}}
+.lg-two .lg-card{margin:0;display:flex;flex-direction:column;gap:8px}
+.lg-two .hero{font-family:var(--display);font-size:34px;font-weight:700;color:var(--ink);line-height:1.05}
+.lg-two .hero small{font-size:16px;color:var(--muted);font-weight:600}
+.lg-two .bar{height:14px}
+.lg-two .rowline{display:flex;justify-content:space-between;gap:10px;font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:6px}
+.lg-two .rowline b{color:var(--ink);font-weight:600}
 .lg-legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--muted);margin:2px 0 8px}
 
 /* Streamlit widgets, nudged toward the same look */
@@ -453,3 +461,83 @@ def fund_panel(L: Ledger, mo: str | None = None, compact: bool = False) -> str:
             '<div class="lg-scroll" style="margin-top:10px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Extras II budget</th>'
             '<th class="r">Core &amp; Extras I leftover</th><th class="r">Top-ups</th><th class="r">Everyday Extras II</th><th>Big expenses</th><th class="r">Fund balance</th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table></div>')
+
+def budget_cards(L: Ledger, mo: str) -> str:
+    """Two cards for a quick check: regular spending (Core + Extras I) against its budget, and Extras II / big-ticket
+    spending against what the Extras II fund has for this month."""
+    sm = L.section_matrix(mo)
+    rows, bud = sm["rows"], sm["budget"]
+    z = dict(zuha=0.0, aneeq=0.0, shared=0.0, unset=0.0)
+
+    def add(*keys):
+        out = dict(z)
+        for k in keys:
+            for c, v in (rows.get(k) or {}).items():
+                out[c] = out.get(c, 0.0) + v
+        return out
+
+    def bar(paid, budget, total):
+        scale = max(budget, total, 1)
+        x, segs = 0.0, ""
+        for k in ("zuha", "aneeq", "shared", "unset"):
+            w = max(0.0, paid.get(k, 0)) / scale * 100
+            segs += f'<span class="s-{"none" if k == "unset" else k}" style="left:{x:.2f}%;width:{w:.2f}%"></span>'
+            x += w
+        if budget > 0 and total > budget:
+            segs += f'<span style="left:{budget / scale * 100:.2f}%;width:2px;background:var(--ink)"></span>'
+        return f'<div class="bar {"over" if budget > 0 and total > budget + .5 else ""}">{segs}</div>'
+
+    def payers(paid):
+        names = {"zuha": "Chase", "aneeq": "Wells Fargo", "shared": "Shared", "unset": "Account not set"}
+        return " ".join(f'<span style="white-space:nowrap;margin-right:10px"><span class="dot d-{"none" if k == "unset" else k}"></span>{names[k]} <b class="num">{m(paid[k])}</b></span>'
+                        for k in ("zuha", "aneeq", "shared", "unset") if abs(paid.get(k, 0)) >= .5)
+
+    def pill(spent, budget):
+        if budget < 0:
+            return f'<span class="pill over">{m(spent - budget)} short</span>'
+        if spent > budget + .5:
+            return f'<span class="pill over">{m(spent - budget)} over</span>'
+        return f'<span class="pill {"near" if spent > budget * .85 else "ok"}">{m(budget - spent)} left</span>'
+
+    # Regulars
+    core, x1 = add("Home Budget"), add("Extras I")
+    reg = add("Home Budget", "Extras I")
+    reg_tot = sum(reg.values())
+    reg_bud = bud.get("Home Budget", 0) + bud.get("Extras I", 0)
+    other = sum(add("other").values())
+    reg_card = (f'<div class="lg-card"><span class="lg-eyebrow">Regulars · Core + Extras I</span>'
+                f'<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
+                f'<span class="hero num">{m(reg_tot)} <small>of {m(reg_bud)}</small></span>{pill(reg_tot, reg_bud)}</div>'
+                f'{bar(reg, reg_bud, reg_tot)}<div style="font-size:13px">{payers(reg)}</div>'
+                f'<div class="rowline"><span>Core</span><span><b class="num">{m(sum(core.values()))}</b> of {m(bud.get("Home Budget", 0))}</span></div>'
+                f'<div class="rowline"><span>Extras I</span><span><b class="num">{m(sum(x1.values()))}</b> of {m(bud.get("Extras I", 0))}</span></div>'
+                + (f'<div class="rowline"><span>Not on a budget line</span><span><b class="num">{m(other)}</b> · see Not in budget</span></div>' if abs(other) >= .5 else "")
+                + '</div>')
+
+    # Extras II / big-ticket
+    x2 = add(DEFAULT_SECTION, "big:" + DEFAULT_SECTION)
+    x2_tot = sum(x2.values())
+    everyday = sum(add(DEFAULT_SECTION).values())
+    fr = next((r for r in L.fund(through=mo)["rows"] if r["month"] == mo), None)
+    if fr:
+        carried = fr["balance"] - fr["net"]
+        added = fr["x2"] + fr["leftover"] + fr["topups"]
+        avail, end = carried + added, fr["balance"]
+    else:
+        carried, added = 0.0, bud.get(DEFAULT_SECTION, 0)
+        avail, end = added, None
+    big_lines = "".join(f'<div class="rowline"><span>★ {e(p["name"])}</span><span><b class="num">{m(sum(rows["proj:" + p["id"]].values()))}</b></span></div>'
+                        for p in L.projects if rows.get("proj:" + p["id"]) and abs(sum(rows["proj:" + p["id"]].values())) >= .5)
+    avail_txt = (f'{m(added)} this month {"+" if carried >= 0 else "−"} {m(abs(carried))} {"saved" if carried >= 0 else "already spent"} before'
+                 if abs(carried) >= .5 else f'{m(added)} this month')
+    x2_card = (f'<div class="lg-card"><span class="lg-eyebrow">Extras II · big-ticket</span>'
+               f'<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
+               f'<span class="hero num">{m(x2_tot)} <small>{("of " + m(avail) + " available") if avail > 0 else ("spent · fund was " + m(-avail) + " short going in")}</small></span>{pill(x2_tot, avail)}</div>'
+               f'{bar(x2, max(avail, 0), x2_tot)}<div style="font-size:13px">{payers(x2)}</div>'
+               f'<div class="rowline"><span>Available</span><span>{avail_txt}</span></div>'
+               + (f'<div class="rowline"><span>Everyday Extras II lines</span><span><b class="num">{m(everyday)}</b></span></div>' if abs(everyday) >= .5 else "")
+               + big_lines
+               + (f'<div class="rowline"><span>Extras II fund after {e(month_label(mo).split()[0])}</span><span><b class="num" style="color:var(--{"good" if end >= 0 else "bad"})">{m(end)}</b></span></div>' if end is not None else "")
+               + '</div>')
+    return f'<div class="lg-two">{reg_card}{x2_card}</div>'
+
