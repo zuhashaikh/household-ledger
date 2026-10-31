@@ -48,7 +48,9 @@ def learn_key(desc: str) -> str:
     d = str(desc or "").lower()
     if "*" in d:
         head, tail = d.split("*", 1)
-        d = head if len(head.strip()) >= 4 else tail
+        # Payment processors put the real merchant after the "*" (PAYPAL *EBAY, SQ *CAFE, TST* GRILL).
+        processor = head.strip() in {"paypal", "pp", "sq", "tst", "sp", "py", "dd", "ppl", "gglpay", "google", "apl", "venmo"}
+        d = tail if processor or len(head.strip()) < 4 else head
     d = re.sub(r"[^a-z0-9&' ]+", " ", d)
     d = _PREFIXES.sub("", d.strip())
     words = [w for w in d.split() if not re.search(r"\d", w) and len(w) > 1 and w not in {"tx", "ca", "wa", "ny", "nj", "nc", "com", "bill"}]

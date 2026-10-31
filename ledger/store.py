@@ -12,7 +12,7 @@ import time
 TX_COLS = ["id", "month", "date", "desc", "spend", "category", "account", "mk", "cat_override", "person",
            "project", "proj_item", "for_line", "moved_from", "statement_id", "added_by"]
 ST_COLS = ["id", "filename", "account", "period_start", "period_end", "uploaded_by", "uploaded_at", "file_id",
-           "n_added", "n_skipped"]
+           "n_added", "n_skipped", "file_hash"]
 CONFIG_KEYS = ["rules", "plan", "projects"]
 
 
@@ -105,6 +105,13 @@ class GoogleStore:
         import gspread
         try:
             ws = self.sh.worksheet(name)
+            have = ws.row_values(1)
+            if have and have != header[:len(have)] or len(have) < len(header):
+                # Older sheet: add any new columns to the header row (new columns always go at the end).
+                merged = have + [c for c in header if c not in have]
+                if ws.col_count < len(merged):
+                    ws.add_cols(len(merged) - ws.col_count)
+                ws.update(values=[merged], range_name="A1", value_input_option="RAW")
         except gspread.WorksheetNotFound:
             ws = self.sh.add_worksheet(title=name, rows=1000, cols=max(len(header), 2))
             ws.update(values=[header], range_name="A1", value_input_option="RAW")
@@ -154,7 +161,8 @@ class GoogleStore:
             fields="id").execute()
         meta = {**meta, "file_id": f["id"]}
         ws = self._tab("statements", ST_COLS)
-        ws.append_row([str(meta.get(c, "")) for c in ST_COLS], value_input_option="RAW")
+        head = ws.row_values(1) or ST_COLS
+        ws.append_row([str(meta.get(c, "")) for c in head], value_input_option="RAW")
         return meta
 
     def get_pdf(self, meta: dict) -> bytes:
