@@ -223,8 +223,31 @@ class Ledger:
     def proj_by_id(self, pid: str | None) -> dict | None:
         return next((p for p in self.projects if p.get("id") == pid), None) if pid else None
 
+    def proj_rules(self) -> list[dict]:
+        """Charges that always count toward a big expense, matched on the description (a regular expression).
+        Default: PayPal pay-later repayments from Chase and Wayfair go to Furniture."""
+        r = self.rules.get("projrule")
+        if r is None:
+            r = [{"match": r"pypl\s*paymthly|paypal\s*pay\s*monthly|pay\s*in\s*4|payin4|wayfair", "project": "furniture",
+                  "label": "PayPal pay-later & Wayfair"}]
+        return [x for x in r if x and x.get("match") and self.proj_by_id(x.get("project"))]
+
     def proj_of(self, t: dict) -> dict | None:
-        return self.proj_by_id(t.get("project"))
+        if t.get("synthetic"):
+            return None
+        if t.get("project"):
+            return self.proj_by_id(t["project"])  # "none" means taken off a big expense on purpose
+        pid = self.learned(t).get("project")
+        if pid and self.proj_by_id(pid):
+            return self.proj_by_id(pid)
+        d = str(t.get("desc") or "").lower()
+        for x in self.proj_rules():
+            try:
+                if re.search(x["match"], d):
+                    return self.proj_by_id(x["project"])
+            except re.error:
+                continue
+        return None
 
     @staticmethod
     def fund_amt(f: dict) -> float:
@@ -254,7 +277,7 @@ class Ledger:
         base = funded + max(0.0, short)
         plan_pct = (fz + max(0.0, short) / 2) / base if base else 0.5
         z_pct = {"even": 0.5, "zuha": 1.0, "aneeq": 0.0}.get(p.get("split") or "", plan_pct)
-        txns = sorted([t for t in self.txns if t.get("project") == p["id"] and not self.contrib_of(t)], key=lambda t: t["date"])
+        txns = sorted([t for t in self.txns if (self.proj_of(t) or {}).get("id") == p["id"] and not self.contrib_of(t)], key=lambda t: t["date"])
         spent = sum(t["spend"] for t in txns)
         names = {i["name"] for i in p.get("items") or []}
         by_item: dict[str, float] = {}
