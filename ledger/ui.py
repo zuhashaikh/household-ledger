@@ -314,8 +314,8 @@ def settle(L: Ledger, mo: str | None = None) -> str:
             'plus money Zuha sent him. If he paid for more of Zuha&#39;s share than she did of his, that extra is absorbed against Core and Extras I '
             'that month (Zuha never owes him). <b>Money he sends</b> pays, in order: anything owed from earlier months, Core, Extras I, '
             'his share of Extras II and big expenses, then money Zuha sent him. Anything beyond that goes to more of that month&#39;s Extras II '
-            'and big expenses (he paid more than half of them, noted as a percentage). Only what&#39;s left after all of Extras II is paid is credit '
-            'toward his next month&#39;s dues.</p>'
+            'and big expenses (he paid more than half of them, noted as a percentage), then, while the Extras II fund is in deficit, toward '
+            'Extras II Zuha paid in earlier months. Only what&#39;s left after that is credit toward his next month&#39;s dues.</p>'
             '<div class="lg-scroll" style="margin-top:12px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Start of month</th>'
             '<th class="r">His share Zuha paid</th><th class="r">Zuha sent him</th><th class="r">His extra, absorbed</th><th class="r">Due this month</th>'
             '<th class="r">He sent</th><th class="r">His part of Extras II</th><th class="r">End of month</th></tr></thead>'
@@ -343,6 +343,9 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
     if r["x2_extra"] >= .005:
         trs.append(f'<tr><td><b>More of Extras II and big expenses</b><span class="why">beyond his half</span></td><td class="r num">–</td><td class="r num">–</td>'
                    f'<td class="r num">{m(r["x2_extra"], True)}</td><td class="r num"><span class="good-t">paid</span></td></tr>')
+    if r["x2_to_deficit"] >= .005:
+        trs.append(f'<tr><td><b>Extras II overspending from earlier months</b><span class="why">fund was {m(r["x2_deficit"])} in deficit</span></td>'
+                   f'<td class="r num">–</td><td class="r num">–</td><td class="r num">{m(r["x2_to_deficit"], True)}</td><td class="r num"><span class="good-t">paid</span></td></tr>')
     if r["x2_pct"] is not None and r["x2_total"] >= 1:
         end += (f'<br><span class="dot d-aneeq"></span><b>Aneeq paid {r["x2_pct"] * 100:.0f}% of Extras II and big expenses</b> '
                 f'<span class="lg-muted">({m(r["x2_his"], True)} of {m(r["x2_total"], True)} in {e(month_label(r["month"]))})</span>')
@@ -369,8 +372,8 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
                'and tick <b>Not between us</b>.</p>') if tx_rows else ""
     return (f'<div class="lg-h2">Where Aneeq&#39;s money went, {e(month_label(r["month"]))}</div>'
             f'<p class="lg-note" style="margin:0 0 8px">{sent}. It pays, in order: anything owed from earlier months, Core, Extras I, '
-            f'his share of Extras II and big expenses, other, money Zuha sent him, then more of Extras II and big expenses. '
-            f'Only what&#39;s left after that is credit for next month.{ab}</p>'
+            f'his share of Extras II and big expenses, other, money Zuha sent him, then more of Extras II and big expenses, '
+            f'then, if the Extras II fund is in deficit, Extras II you paid in earlier months. Only what&#39;s left after that is credit for next month.{ab}</p>'
             '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>In order</th><th class="r">He owed</th>'
             '<th class="r">Covered by his own spending</th><th class="r">Paid from money he sent</th><th class="r">Still owed</th></tr></thead>'
             f'<tbody>{"".join(trs) or "<tr><td colspan=5 class=lg-muted>Nothing owed this month.</td></tr>"}'
@@ -505,6 +508,15 @@ def budget_cards(L: Ledger, mo: str) -> str:
     reg_tot = sum(reg.values())
     reg_bud = bud.get("Home Budget", 0) + bud.get("Extras I", 0)
     other = sum(add("other").values())
+    br = {r["cat"]: r for r in L.budget_rows(mo)}
+    plan = L.plan_for(mo)
+    reg_lines = sorted({c for c in plan if L.plan["groups"].get(c) in ("Home Budget", "Extras I") and not L.is_excluded(c)}
+                       | {c for c, r in br.items() if L.plan["groups"].get(c) in ("Home Budget", "Extras I") and abs(r["all"]) >= .5},
+                       key=lambda c: (L.plan["groups"].get(c) != "Home Budget", -float(plan.get(c) or 0), c.lower()))
+    line_rows = "".join(f'<div class="rowline"><span>{e(c)} <span style="opacity:.7">· {"Core" if L.plan["groups"].get(c) == "Home Budget" else "Extras I"}</span></span>'
+                        f'<span><b class="num">{m(br[c]["all"]) if c in br else "$0"}</b> of {m(float(plan.get(c) or 0))}</span></div>' for c in reg_lines)
+    details = (f'<details style="font-size:13px"><summary style="cursor:pointer;color:var(--muted)">Show all {len(reg_lines)} lines in this budget</summary>'
+               f'{line_rows}</details>')
     reg_card = (f'<div class="lg-card"><span class="lg-eyebrow">Regulars · Core + Extras I</span>'
                 f'<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
                 f'<span class="hero num">{m(reg_tot)} <small>of {m(reg_bud)}</small></span>{pill(reg_tot, reg_bud)}</div>'
@@ -512,7 +524,7 @@ def budget_cards(L: Ledger, mo: str) -> str:
                 f'<div class="rowline"><span>Core</span><span><b class="num">{m(sum(core.values()))}</b> of {m(bud.get("Home Budget", 0))}</span></div>'
                 f'<div class="rowline"><span>Extras I</span><span><b class="num">{m(sum(x1.values()))}</b> of {m(bud.get("Extras I", 0))}</span></div>'
                 + (f'<div class="rowline"><span>Not on a budget line</span><span><b class="num">{m(other)}</b> · see Not in budget</span></div>' if abs(other) >= .5 else "")
-                + '</div>')
+                + details + '</div>')
 
     # Extras II / big-ticket
     x2 = add(DEFAULT_SECTION, "big:" + DEFAULT_SECTION)
@@ -528,11 +540,11 @@ def budget_cards(L: Ledger, mo: str) -> str:
         avail, end = added, None
     big_lines = "".join(f'<div class="rowline"><span>★ {e(p["name"])}</span><span><b class="num">{m(sum(rows["proj:" + p["id"]].values()))}</b></span></div>'
                         for p in L.projects if rows.get("proj:" + p["id"]) and abs(sum(rows["proj:" + p["id"]].values())) >= .5)
-    avail_txt = (f'{m(added)} this month {"+" if carried >= 0 else "−"} {m(abs(carried))} {"saved" if carried >= 0 else "already spent"} before'
-                 if abs(carried) >= .5 else f'{m(added)} this month')
+    avail_txt = (f'<b class="num">{m(avail)}</b> = {m(added)} this month {"+" if carried >= 0 else "−"} {m(abs(carried))} {"saved" if carried >= 0 else "already spent"} before'
+                 if abs(carried) >= .5 else f'<b class="num">{m(avail)}</b> this month')
     x2_card = (f'<div class="lg-card"><span class="lg-eyebrow">Extras II · big-ticket</span>'
                f'<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
-               f'<span class="hero num">{m(x2_tot)} <small>{("of " + m(avail) + " available") if avail > 0 else ("spent · fund was " + m(-avail) + " short going in")}</small></span>{pill(x2_tot, avail)}</div>'
+               f'<span class="hero num">{m(x2_tot)} <small>{("of " + m(avail) + " available") if avail > 0 else "spent"}</small></span>{pill(x2_tot, avail)}</div>'
                f'{bar(x2, max(avail, 0), x2_tot)}<div style="font-size:13px">{payers(x2)}</div>'
                f'<div class="rowline"><span>Available</span><span>{avail_txt}</span></div>'
                + (f'<div class="rowline"><span>Everyday Extras II lines</span><span><b class="num">{m(everyday)}</b></span></div>' if abs(everyday) >= .5 else "")

@@ -674,11 +674,14 @@ class Ledger:
         Zuha's share of anything he paid. Money Zuha sends him is also due.
         Money he sends pays, in order: anything owed from earlier months, Core, Extras I, Extras II (incl. big
         expenses), other, money Zuha sent him. What's left goes to more of that month's Extras II and big expenses
-        (he simply paid more than half of them; x2_pct says how much), up to all of what Zuha paid there. Only what's
-        left after that is credit for next month.
+        (he simply paid more than half of them; x2_pct says how much), up to all of what Zuha paid there. Then, while
+        the Extras II fund is in deficit, toward Extras II Zuha paid in earlier months that he hasn't covered (up to the
+        deficit). Only what's left after that is credit for next month.
         If he paid for more of Zuha's share than she did of his (his extra spending), that covers his other dues
         first; any of it left over is absorbed, since Zuha never owes him.
         running > 0: he owes Zuha. running < 0: he has credit."""
+        fund_end = {r["month"]: r["balance"] for r in self.fund()["rows"]}
+        pool = 0.0   # Extras II Zuha paid in earlier months that Aneeq hasn't covered
         bal, out = 0.0, []
         for m in self.months():
             s = self.compute(m)["settle"]
@@ -702,6 +705,12 @@ class Ledger:
             cash -= extra_x2
             his_x2 += extra_x2
             x2_pct = his_x2 / total if total > 0 else None
+            # Then, while the Extras II fund is in deficit, toward Extras II that Zuha paid in earlier months.
+            deficit = max(0.0, -fund_end.get(m, 0.0))
+            to_deficit = min(cash, pool, deficit)
+            cash -= to_deficit
+            pool -= to_deficit
+            pool += max(0.0, total - his_x2)
             unpaid = sum(a["unpaid"] for a in alloc)
             start = bal
             bal = unpaid if unpaid > 0.005 else (-cash if cash > 0.005 else 0.0)
@@ -711,6 +720,7 @@ class Ledger:
                         "due": max(0.0, s["net"] + s["aneeq_to_zuha"]), "due_by_section": due_month,
                         "net": bal - start, "absorbed": spend_extra, "start": start, "running": bal,
                         "x2_total": total, "x2_his": his_x2, "x2_extra": extra_x2, "x2_pct": x2_pct,
+                        "x2_deficit": deficit, "x2_to_deficit": to_deficit, "x2_pool": pool,
                         "alloc": alloc, "skipped": s["skipped"]})
         return out
 
