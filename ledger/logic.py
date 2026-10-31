@@ -14,6 +14,19 @@ PEOPLE = {"zuha": "Zuha", "aneeq": "Aneeq", "shared": "Shared"}
 PAYER_LABEL = {"zuha": "Zuha (Chase + pay)", "aneeq": "Aneeq (Wells Fargo)", "shared": "Joint", "unset": "Payer not set"}
 SECTIONS = [("Home Budget", "Core budget"), ("Extras I", "Extras I"), ("Extras II (Split 50:50)", "Extras II")]
 DEFAULT_SECTION = "Extras II (Split 50:50)"
+# Paying off a card: the card's own charges are already counted, so the payment (on the checking side) and the
+# payment received (on the card side) are never spending.
+CARD_PAYMENT = re.compile(r"payment\s*-?\s*thank\s*you|thank\s*you\s*-?\s*payment|automatic payment|"
+                          r"(credit\s*c(ar)?d|crd|card)\s*(auto\s*pay|autopay|e?-?payment|e?pay|pmt)|"
+                          r"payment to (chase|wells fargo|wf|amex|citi|discover|capital one)|"
+                          r"(chase|wells\s*fargo|wf)\s*(credit\s*)?card\s*(auto\s*pay|autopay|payment|pmt|epay)|"
+                          r"payment received|amex epayment|discover e-payment|applecard gsbank", re.I)
+# Moving money between your own accounts.
+OWN_TRANSFER = re.compile(r"\bonline transfer\b|\btransfer (to|from) (sav|chk|check|acct|account|my|share|\S*x{2,}|\S*\d{4})|"
+                          r"\bxfer\b|moneyline", re.I)
+# Money between Zuha and Aneeq, as it appears on each side. It is counted once, on Zuha's accounts.
+SPOUSE_NAME = {"zuha": re.compile(r"zuha|shaikh", re.I), "aneeq": re.compile(r"aneeq|cheema", re.I)}
+MONEY_MOVE = re.compile(r"zelle|transfer|xfer|venmo|cash app|paypal\s*\*?\s*(transfer|inst xfer)", re.I)
 DEFAULT_EXCLUDE = re.compile(r"transfer|credit card payment|payment|paycheck|income|deposit|refund reversal", re.I)
 
 
@@ -225,8 +238,24 @@ class Ledger:
     def learned(self, t: dict) -> dict:
         return (self.rules.get("learn") or {}).get(learn_key(t.get("desc", ""))) or {}
 
+    def never_spending(self, t: dict) -> str | None:
+        """Lines that must never count as spending, whatever a category or remembered choice says:
+        card payments, transfers between your own accounts, and money between you on Aneeq's accounts
+        (it's already counted once, from Zuha's side)."""
+        if t.get("synthetic"):
+            return None
+        d = str(t.get("desc") or "")
+        if self.payer_of(t) == "aneeq" and MONEY_MOVE.search(d) and SPOUSE_NAME["zuha"].search(d):
+            return "Transfer"
+        if CARD_PAYMENT.search(d):
+            return "Credit Card Payment"
+        other = {"zuha": "aneeq", "aneeq": "zuha"}.get(self.payer_of(t) or "")
+        if OWN_TRANSFER.search(d) and other and not SPOUSE_NAME[other].search(d):
+            return "Transfer"
+        return None
+
     def cat_of(self, t: dict) -> str:
-        return (t.get("cat_override") or self.learned(t).get("line") or self.pat_cat(t) or self.rules["recat"].get(t.get("mk", ""))
+        return (t.get("cat_override") or self.never_spending(t) or self.learned(t).get("line") or self.pat_cat(t) or self.rules["recat"].get(t.get("mk", ""))
                 or self.rules["catmap"].get(t.get("category", "")) or t.get("category") or "Uncategorized")
 
     def is_excluded(self, cat: str) -> bool:
