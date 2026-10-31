@@ -104,7 +104,7 @@ def summary(L: Ledger, mo: str) -> str:
     res = L.compute(mo)
     owed, change = L.owed_through(mo)
     sr = next((r for r in L.settle_rows() if r["month"] == mo), None)
-    ahead_txt = (f' · he paid {sr["x2_pct"] * 100:.0f}% of Extras II' if sr and sr["x2_pct"] is not None and sr["x2_pct"] > .505 else "")
+    ahead_txt = ""
     pay = {"zuha": 0.0, "aneeq": 0.0}
     for t in L.deduction_txns(mo) if L.month_txns(mo, with_deductions=False) else []:
         pay[t["payer"]] = pay.get(t["payer"], 0) + t["spend"]
@@ -303,7 +303,7 @@ def settle(L: Ledger, mo: str | None = None) -> str:
         you = ("+" + m(r["you_sent"])) if r["you_sent"] >= .5 else "–"
         he = ("−" + m(r["he_sent"])) if r["he_sent"] >= .5 else "–"
         absorbed = f'<span class="lg-muted">{m(r["absorbed"])}</span>' if r["absorbed"] >= 1 else "–"
-        pct = f'{r["x2_pct"] * 100:.0f}%' if r["x2_pct"] is not None else "–"
+        pct = f'{m(r["x2_his"])} of {m(r["x2_total"])}' if r["x2_total"] >= 1 else "–"
         body_rows.append(f'<tr><td><b>{e(month_label(r["month"]))}</b>{skipped}</td><td class="r num">{bal(r["start"])}</td>'
                          f'<td class="r num">{m(r["gross"])}</td><td class="r num">{you}</td><td class="r num">{absorbed}</td>'
                          f'<td class="r num"><b>{m(r["due"])}</b></td><td class="r num">{he}</td><td class="r num">{pct}</td><td class="r num">{bal(r["running"])}</td></tr>')
@@ -318,7 +318,7 @@ def settle(L: Ledger, mo: str | None = None) -> str:
             'Extras II Zuha paid in earlier months. Only what&#39;s left after that is credit toward his next month&#39;s dues.</p>'
             '<div class="lg-scroll" style="margin-top:12px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Start of month</th>'
             '<th class="r">His share Zuha paid</th><th class="r">Zuha sent him</th><th class="r">His extra, absorbed</th><th class="r">Due this month</th>'
-            '<th class="r">He sent</th><th class="r">His part of Extras II</th><th class="r">End of month</th></tr></thead>'
+            '<th class="r">He sent</th><th class="r">Extras II he covered</th><th class="r">End of month</th></tr></thead>'
             f'<tbody>{body}</tbody></table></div>' + settle_breakdown(L, rows, mo))
 
 
@@ -347,8 +347,12 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
         trs.append(f'<tr><td><b>Extras II overspending from earlier months</b><span class="why">fund was {m(r["x2_deficit"])} in deficit</span></td>'
                    f'<td class="r num">–</td><td class="r num">–</td><td class="r num">{m(r["x2_to_deficit"], True)}</td><td class="r num"><span class="good-t">paid</span></td></tr>')
     if r["x2_pct"] is not None and r["x2_total"] >= 1:
-        end += (f'<br><span class="dot d-aneeq"></span><b>Aneeq paid {r["x2_pct"] * 100:.0f}% of Extras II and big expenses</b> '
-                f'<span class="lg-muted">({m(r["x2_his"], True)} of {m(r["x2_total"], True)} in {e(month_label(r["month"]))})</span>')
+        half = r["x2_total"] / 2
+        more = max(0.0, r["x2_his"] - half)
+        end += (f'<br><span class="dot d-aneeq"></span>Of {e(month_label(r["month"]).split()[0])}&#39;s {m(r["x2_total"], True)} of Extras II and big expenses, '
+                f'<b>Aneeq covered {m(r["x2_his"], True)}</b>'
+                + (f' <span class="lg-muted">(his half, {m(half, True)}, plus {m(more, True)} of yours)</span>' if more >= .5 else
+                   (f' <span class="lg-muted">(his half is {m(half, True)})</span>' if r["x2_his"] < half - .5 else ' <span class="lg-muted">(his half)</span>')))
     sent = f'He sent {m(r["he_sent"], True)}' + (f' and had {m(-r["start"], True)} credit from earlier' if r["start"] <= -1 else "")
     ab = f' {m(r["absorbed"], True)} of his own extra spending was absorbed.' if r["absorbed"] >= 1 else ""
     his_for_her = [t for t in L.month_txns(r["month"], with_deductions=False)
@@ -517,10 +521,31 @@ def budget_cards(L: Ledger, mo: str) -> str:
                         f'<span><b class="num">{m(br[c]["all"]) if c in br else "$0"}</b> of {m(float(plan.get(c) or 0))}</span></div>' for c in reg_lines)
     details = (f'<details style="font-size:13px"><summary style="cursor:pointer;color:var(--muted)">Show all {len(reg_lines)} lines in this budget</summary>'
                f'{line_rows}</details>')
+    # Extras II position (needed to say where the regulars' leftover goes)
+    _fr = next((r for r in L.fund(through=mo)["rows"] if r["month"] == mo), None)
+    closed = bool(_fr and _fr["closed"])
+    x2_spent_now = sum(add(DEFAULT_SECTION, "big:" + DEFAULT_SECTION).values())
+    x2_avail_now = ((_fr["balance"] - _fr["net"]) + _fr["x2"] + _fr["leftover"] + _fr["topups"]) if _fr else bud.get(DEFAULT_SECTION, 0)
+    x2_short = max(0.0, x2_spent_now - x2_avail_now)
+    reg_left = reg_bud - reg_tot
+    if reg_left > .5 and closed:
+        reg_pill = f'<span class="pill nobud">{m(reg_left)} under · moved to Extras II</span>'
+        reg_note = (f'<div class="rowline" style="color:var(--ink)"><span>{m(reg_left)} under budget</span>'
+                    '<span>already added to the Extras II fund (month closed)</span></div>')
+    elif reg_left > .5 and x2_short > .5:
+        used = min(reg_left, x2_short)
+        rest = reg_left - used
+        reg_pill = (f'<span class="pill over">{m(reg_left)} under · all used by Extras II</span>' if rest < .5 else
+                    f'<span class="pill near">{m(rest)} truly left</span>')
+        reg_note = (f'<div class="rowline" style="color:var(--ink)"><span>{m(reg_left)} under budget</span>'
+                    f'<span>{m(used)} of it covers Extras II overspending{(", " + m(rest) + " left") if rest >= .5 else ""}</span></div>')
+    else:
+        reg_pill = pill(reg_tot, reg_bud)
+        reg_note = ""
     reg_card = (f'<div class="lg-card"><span class="lg-eyebrow">Regulars · Core + Extras I</span>'
                 f'<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
-                f'<span class="hero num">{m(reg_tot)} <small>of {m(reg_bud)}</small></span>{pill(reg_tot, reg_bud)}</div>'
-                f'{bar(reg, reg_bud, reg_tot)}<div style="font-size:13px">{payers(reg)}</div>'
+                f'<span class="hero num">{m(reg_tot)} <small>of {m(reg_bud)}</small></span>{reg_pill}</div>'
+                f'{bar(reg, reg_bud, reg_tot)}<div style="font-size:13px">{payers(reg)}</div>{reg_note}'
                 f'<div class="rowline"><span>Core</span><span><b class="num">{m(sum(core.values()))}</b> of {m(bud.get("Home Budget", 0))}</span></div>'
                 f'<div class="rowline"><span>Extras I</span><span><b class="num">{m(sum(x1.values()))}</b> of {m(bud.get("Extras I", 0))}</span></div>'
                 + (f'<div class="rowline"><span>Not on a budget line</span><span><b class="num">{m(other)}</b> · see Not in budget</span></div>' if abs(other) >= .5 else "")
@@ -551,5 +576,12 @@ def budget_cards(L: Ledger, mo: str) -> str:
                + big_lines
                + (f'<div class="rowline"><span>Extras II fund after {e(month_label(mo).split()[0])}</span><span><b class="num" style="color:var(--{"good" if end >= 0 else "bad"})">{m(end)}</b></span></div>' if end is not None else "")
                + '</div>')
-    return f'<div class="lg-two">{reg_card}{x2_card}</div>'
+    net = (reg_left if not closed else 0.0) + (x2_avail_now - x2_spent_now)
+    overall = (f'<div class="lg-card" style="margin-top:12px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">'
+               f'<span><span class="lg-eyebrow">Overall, {e(month_label(mo).split()[0])}</span><br>'
+               f'<span class="lg-muted" style="font-size:13px">Regulars left over, plus what the Extras II fund has left'
+               f'{" (it already includes the regulars leftover)" if closed else ""}</span></span>'
+               f'<span class="hero num" style="font-family:var(--display);font-size:26px;font-weight:700;color:var(--{"good" if net >= 0 else "bad"})">'
+               f'{m(abs(net))} {"ahead" if net >= 0 else "behind"}</span></div>')
+    return f'<div class="lg-two">{reg_card}{x2_card}</div>{overall}'
 
