@@ -337,14 +337,15 @@ def page_transactions(L: Ledger, m: str, person: str):
         elif L.shifted(t):
             status = f"Counts in {month_label(L.month_of(t))} (billed for next month) · " + status
         keep = {"Needs a person": not (who or ex or cb or pj), "All": True, "Big expenses": bool(pj and not cb),
-                "Money between you": bool(cb), "Not counted": ex}[show]
+                "Money between you": bool(cb) or bool(t.get("not_between")), "Not counted": ex}[show]
         if not keep or (q and q not in f"{t['desc']} {c} {t.get('account','')}".lower()):
             continue
         line_val = proj_label.get(pj["id"]) if pj else ((t.get("for_line") or NO_LINE) if cb else c)
         recs.append({"Date": t["date"], "Merchant": t["desc"], "Paid from": PAID_NAME.get(L.payer_of(t) or "", "⚪ not set"),
                      "Amount": t["spend"], "Line": line_val,
                      "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
-                     "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False, "Status": status})
+                     "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False,
+                     "Not between us": bool(t.get("not_between")), "Status": status})
         ids.append(t["id"])
     if not recs:
         st.info("Nothing here.")
@@ -363,6 +364,7 @@ def page_transactions(L: Ledger, m: str, person: str):
             "Who": st.column_config.SelectboxColumn(options=[UNSET] + WHO_OPTS[1:] + [NO_ITEM], help="Whose budget this counts toward"),
             "Item": st.column_config.SelectboxColumn(options=[NO_ITEM] + items, help="Big-expense item"),
             "Only this charge": st.column_config.CheckboxColumn(help="Tick to change just this charge. Otherwise the choice is remembered for the merchant from now on."),
+            "Not between us": st.column_config.CheckboxColumn(help="Tick if this was matched as money between you but isn't (e.g. a payment that just mentions Wells Fargo)."),
             "Status": st.column_config.TextColumn(disabled=True)})
     html('<p class="lg-note" style="margin:6px 0">Changes are remembered for the merchant: this month, later months and future statements. '
          'Earlier months keep what they had. To forget a remembered choice, set Line to — or Who to ⚪ Not set. '
@@ -415,6 +417,8 @@ def page_transactions(L: Ledger, m: str, person: str):
                 else:
                     learn.setdefault(key, {})["who"] = who if who else DROP
                     ch["person"] = None
+            if bool(new.get("Not between us")) != bool(old.get("Not between us")):
+                ch["not_between"] = "1" if new.get("Not between us") else None
             if (new["Item"] or NO_ITEM) != (old["Item"] or NO_ITEM):
                 ch["proj_item"] = None if new["Item"] in (None, "", NO_ITEM) else new["Item"]
             if ch:
