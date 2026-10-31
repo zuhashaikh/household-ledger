@@ -380,8 +380,13 @@ class Ledger:
         return out
 
     # ---------- importing ----------
-    def add_parsed(self, rows: list[dict], statement_id: str, added_by: str) -> tuple[list[dict], int]:
-        """Dedupe parsed statement rows against what's stored. Returns (new transactions, skipped duplicates)."""
+    def add_parsed(self, rows: list[dict], statement_id: str, added_by: str, tolerance_days: int = 3) -> tuple[list[dict], int]:
+        """Dedupe incoming rows (from a PDF statement or the bank feed) against what's stored.
+        Same source: an exact match (bank-feed id, or same day/account/amount for statements).
+        Across sources (statement vs bank feed): same account and amount within a few days, because a bank
+        feed and a statement can date the same charge a day or two apart. Returns (new transactions, duplicates)."""
+        import datetime as _dt
+        day = lambda d: _dt.date.fromisoformat(d).toordinal()
         seen: dict[str, int] = {}
         used: set[str] = set()
         new, dup = [], 0
@@ -391,8 +396,21 @@ class Ledger:
             seen[base] = seen.get(base, 0) + 1
             tid = fnv_id(base + "|" + str(seen[base]))
             spend = round(r["amt"], 2)
-            twin = next((t for t in existing + new if t["id"] not in used and (t["id"] == tid or (
-                t["date"] == r["date"] and t["account"] == r["account"] and abs(t["spend"] - spend) < 0.005))), None)
+            ext = r.get("ext_id")
+            rd = day(r["date"])
+
+            def same(t, pool_is_existing):
+                if t["id"] in used:
+                    return False
+                if ext and t.get("ext_id"):
+                    return t["ext_id"] == ext
+                if t["account"] != r["account"] or abs(t["spend"] - spend) >= 0.005:
+                    return t["id"] == tid
+                if bool(ext) != bool(t.get("ext_id")):  # one from the feed, one from a statement
+                    return pool_is_existing and abs(day(t["date"]) - rd) <= tolerance_days
+                return t["date"] == r["date"] or t["id"] == tid
+
+            twin = next((t for t in existing if same(t, True)), None) or next((t for t in new if same(t, False)), None)
             if twin:
                 used.add(twin["id"])
                 dup += 1
@@ -400,6 +418,8 @@ class Ledger:
             t = {"id": tid, "month": r["date"][:7], "date": r["date"], "desc": r["desc"], "mk": merchant_key(r["desc"]),
                  "spend": spend, "category": r.get("category") or "Uncategorized", "account": r["account"],
                  "statement_id": statement_id, "added_by": added_by}
+            if ext:
+                t["ext_id"] = ext
             new.append(t)
             used.add(tid)
         return new, dup

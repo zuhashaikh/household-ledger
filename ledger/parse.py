@@ -116,3 +116,48 @@ def normalize(res: dict, ledger: Ledger) -> dict:
     totals = res.get("statementTotals") or {}
     return {"account": acct, "rows": rows, "totals": totals,
             "start": _parse_date(res.get("periodStart")), "end": _parse_date(res.get("periodEnd"))}
+
+
+CATEGORIZE = """Categorize these bank transactions for a household budget. Reply with ONLY a JSON array, one object per transaction, in the same order:
+[{{"i":0,"kind":"spend","category":"Grocery"}}]
+
+- kind is one of: spend, refund, payment, transfer, income, fee, interest. A payment to a credit card is "payment". Money sent between the household's own accounts, or received from another person or bank (Zelle, transfers, deposits), is "transfer". Paychecks are "income".
+- category: "Payment", "Transfer" or "Income" for those kinds. Otherwise exactly one of these budget lines: {lines}. If none fits, "Other".
+- How this household maps common spending categories onto its budget lines: {catmap}.
+- Merchants this household has already categorized (follow these):
+{known}
+
+Transactions (amount: positive = money out, negative = money in):
+{rows}
+"""
+
+
+def categorize(rows: list[dict], ledger: Ledger, api_key: str, model: str) -> list[dict]:
+    """Fill in category for rows the household's own rules don't cover. One Claude call for the whole batch."""
+    import anthropic
+
+    if not rows:
+        return rows
+    p = build_prompt(ledger)
+    known = p.split("(follow these):\n", 1)[1].split("\n- Known accounts", 1)[0] if "(follow these):\n" in p else "(none yet)"
+    catmap = "; ".join(f"{k} → {v}" for k, v in (ledger.rules.get("catmap") or {}).items()) or "(none)"
+    listing = "\n".join(f"{i}. {r['desc']} | {r['amt']:.2f} | {r['account']}" for i, r in enumerate(rows))
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(model=model, max_tokens=8000, messages=[{"role": "user", "content": CATEGORIZE.format(
+        lines=json.dumps(ledger.budget_lines()), catmap=catmap, known=known, rows=listing)}])
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        return rows
+    lines = set(ledger.budget_lines())
+    for x in json.loads(m.group(0)):
+        try:
+            r = rows[int(x.get("i"))]
+        except (TypeError, ValueError, IndexError):
+            continue
+        kind = x.get("kind") or ""
+        cat = {"payment": "Payment", "transfer": "Transfer", "income": "Income"}.get(kind) or str(x.get("category") or "Other")
+        if cat not in lines and cat not in ("Payment", "Transfer", "Income", "Other"):
+            cat = ledger.rules["catmap"].get(cat, cat)
+        r["category"] = cat
+    return rows

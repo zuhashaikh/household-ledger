@@ -10,7 +10,7 @@ import os
 import time
 
 TX_COLS = ["id", "month", "date", "desc", "spend", "category", "account", "mk", "cat_override", "person",
-           "project", "proj_item", "for_line", "moved_from", "statement_id", "added_by"]
+           "project", "proj_item", "for_line", "moved_from", "statement_id", "added_by", "ext_id"]
 ST_COLS = ["id", "filename", "account", "period_start", "period_end", "uploaded_by", "uploaded_at", "file_id",
            "n_added", "n_skipped", "file_hash"]
 CONFIG_KEYS = ["rules", "plan", "projects"]
