@@ -16,7 +16,7 @@ import uuid
 import pandas as pd
 import streamlit as st
 
-from ledger.logic import (rename_line, learn_key, merchant_key, DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE, SECTIONS, Ledger, month_label)
+from ledger.logic import (DONT_COUNT, rename_line, learn_key, merchant_key, DEFAULT_EXCLUDE, DEFAULT_SECTION, PAYER_LABEL, PEOPLE, SECTIONS, Ledger, month_label)
 from ledger import bankfeed, ui
 from ledger.store import GoogleStore, LocalStore, now_iso
 
@@ -355,7 +355,7 @@ def page_transactions(L: Ledger, m: str, person: str):
     proj_label = {p["id"]: "★ " + p["name"] for p in L.projects}
     label_proj = {v: k for k, v in proj_label.items()}
     lines = L.all_categories(m)
-    line_opts = [NO_LINE] + lines + list(proj_label.values())
+    line_opts = [NO_LINE] + lines + list(proj_label.values()) + ["🚫 " + DONT_COUNT]
     items = sorted({i["name"] for p in L.projects for i in p.get("items") or []})
 
     recs, ids = [], []
@@ -398,6 +398,8 @@ def page_transactions(L: Ledger, m: str, person: str):
         if not keep or (q and q not in f"{t['desc']} {c} {t.get('account','')}".lower()):
             continue
         line_val = proj_label.get(pj["id"]) if pj else ((t.get("for_line") or NO_LINE) if cb else (NO_LINE if sp else c))
+        if t.get("cat_override") == DONT_COUNT:
+            line_val, status = "🚫 " + DONT_COUNT, "Not counted (you chose this) · set a Line to count it again"
         recs.append({"Date": t["date"], "Merchant": t["desc"], "Paid from": PAID_NAME.get(L.payer_of(t) or "", "⚪ not set"),
                      "Amount": t["spend"], "Line": line_val,
                      "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
@@ -436,7 +438,10 @@ def page_transactions(L: Ledger, m: str, person: str):
             cb = L.contrib_of(t)
             key = learn_key(t["desc"])
             once = bool(new.get("Only this charge"))
-            if new["Line"] != old["Line"] and new["Line"]:
+            if new["Line"] != old["Line"] and new["Line"] == "🚫 " + DONT_COUNT:
+                ch["cat_override"] = DONT_COUNT   # always just this charge
+                ch["project"] = "none" if L.proj_of({**t, "project": None}) else None
+            elif new["Line"] != old["Line"] and new["Line"]:
                 if new["Line"] == NO_LINE:
                     if cb:
                         ch["for_line"] = None

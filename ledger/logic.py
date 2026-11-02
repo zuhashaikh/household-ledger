@@ -27,6 +27,9 @@ OWN_TRANSFER = re.compile(r"\bonline transfer\b|\btransfer (to|from) (sav|chk|ch
 # Money between Zuha and Aneeq, as it appears on each side. It is counted once, on Zuha's accounts.
 SPOUSE_NAME = {"zuha": re.compile(r"zuha|shaikh", re.I), "aneeq": re.compile(r"aneeq|cheema", re.I)}
 MONEY_MOVE = re.compile(r"zelle|transfer|xfer|venmo|cash app|paypal\s*\*?\s*(transfer|inst xfer)", re.I)
+# A credit that undoes an earlier charge: a reversed or returned Zelle, a cancelled payment, a chargeback.
+REVERSAL = re.compile(r"revers|returned|\breturn\b|cancel|chargeback|refund|credit adj", re.I)
+DONT_COUNT = "Don't count"
 DEFAULT_EXCLUDE = re.compile(r"transfer|credit card payment|payment|paycheck|income|deposit|refund reversal", re.I)
 
 
@@ -134,14 +137,27 @@ class Ledger:
                 charges.setdefault((t.get("account"), round(t["spend"], 2), self._merchant_root(t.get("desc", ""))), []).append(t)
         used, out = set(), {}
         refunds = sorted((t for t in self.txns if t.get("spend", 0) < 0 and not t.get("synthetic")), key=lambda t: t["date"])
+        by_amt: dict[tuple, list] = {}
+        for k, v in charges.items():
+            by_amt.setdefault((k[0], k[1]), []).extend(v)
         for r in refunds:
-            if "zelle" in str(r.get("desc", "")).lower() or self.contrib_of(r):
+            if self.contrib_of(r):
                 continue
-            root = self._merchant_root(r.get("desc", ""))
-            if not root:
-                continue
-            cands = [c for c in charges.get((r.get("account"), round(-r["spend"], 2), root), [])
-                     if c["id"] not in used and 0 <= day(r["date"]) - day(c["date"]) <= 60]
+            d = str(r.get("desc", ""))
+            is_zelle, reversal = "zelle" in d.lower(), bool(REVERSAL.search(d))
+            if is_zelle and not reversal:
+                continue  # money someone sent you, not a refund
+            root = self._merchant_root(d)
+            near = lambda c: c["id"] not in used and 0 <= day(r["date"]) - day(c["date"]) <= 60
+            cands = [c for c in charges.get((r.get("account"), round(-r["spend"], 2), root), []) if near(c)] if root else []
+            if not cands and reversal:
+                # A reversal is often worded differently from the charge ("Zelle payment reversal", "returned"):
+                # same account and amount; for a Zelle, the charge must be a Zelle too, ideally to the same person.
+                pool = [c for c in by_amt.get((r.get("account"), round(-r["spend"], 2)), []) if near(c)
+                        and (not is_zelle or "zelle" in str(c.get("desc", "")).lower())]
+                words = set(learn_key(d).split()) - {"zelle", "payment", "to", "from", "reversal", "returned", "return", "cancelled", "canceled"}
+                named = [c for c in pool if words & set(learn_key(c.get("desc", "")).split())]
+                cands = named or pool
             if cands:
                 c = max(cands, key=lambda c: c["date"])  # the most recent matching charge
                 used.add(c["id"])
@@ -372,10 +388,16 @@ class Ledger:
         return None
 
     def cat_of(self, t: dict) -> str:
+        if not t.get("cat_override") and t.get("spend", 0) < 0 and not t.get("synthetic"):
+            orig = self.refund_matches().get(t.get("id"))
+            if orig:  # a refund or reversal counts on the same line as the charge it undoes
+                return self.cat_of(orig)
         return (t.get("cat_override") or self.never_spending(t) or self.learned(t).get("line") or self.pat_cat(t) or self.rules["recat"].get(t.get("mk", ""))
                 or self.rules["catmap"].get(t.get("category", "")) or t.get("category") or "Uncategorized")
 
     def is_excluded(self, cat: str) -> bool:
+        if cat == DONT_COUNT:
+            return True
         v = self.rules["exclude"].get(cat)
         if v is True or v is False:
             return v
