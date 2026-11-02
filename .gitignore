@@ -3,3 +3,5 @@
 seed_data.json
 __pycache__/
 *.pyc
+client_secret*.json
+token*.json
