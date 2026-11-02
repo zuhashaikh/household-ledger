@@ -328,7 +328,7 @@ def big_card(L: Ledger, p: dict) -> str:
           f' · paid on his own cards {m(ps["direct"])}.</p>') if abs(ps["share"]) >= 1 else ""
     charges = "".join(f'<tr><td class="num lg-muted" style="white-space:nowrap">{e(t["date"])}</td><td><b>{e(t["desc"])}</b><span class="why">{e(t.get("account",""))} · {e(PAYER_LABEL.get(L.payer_of(t) or "unset"))}{(" · " + e(t["proj_item"])) if t.get("proj_item") else ""}</span></td><td class="r num">{m(t["spend"], True)}</td></tr>' for t in s["txns"])
     charges_html = (f'<div class="lg-eyebrow" style="margin:14px 0 6px">Charges</div><div class="lg-scroll"><table class="lg-table"><tbody>{charges}</tbody></table></div>'
-                    if charges else f'<p class="lg-note">No charges yet. In Transactions, choose “★ {e(p["name"])}” as a charge&#39;s line.</p>')
+                    if charges else f'<p class="lg-note">No charges yet. Under Manage → Fix a charge, choose “★ {e(p["name"])}” as a charge&#39;s line.</p>')
     return (f'<div class="lg-card"><h3>{e(p["name"])}</h3>'
             f'<div class="lg-stats"><div><span class="lg-eyebrow">Estimated</span><div class="v num">{m(s["est"])}</div></div>'
             f'<div><span class="lg-eyebrow">Spent so far (in statements)</span><div class="v num">{m(s["spent"])}</div><span class="lg-muted" style="font-size:13px">{len(s["txns"])} transaction{"s" if len(s["txns"]) != 1 else ""}</span></div></div>'
@@ -429,7 +429,7 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
                       f'<td class="r num">{m(abs(t["spend"]), True)}</td></tr>' for t in sorted(tx, key=lambda t: t["date"]))
     tx_html = (f'<div class="lg-eyebrow" style="margin:14px 0 6px">Money counted between you in {e(month_label(r["month"]))}</div>'
                f'<div class="lg-scroll"><table class="lg-table"><tbody>{tx_rows}</tbody></table></div>'
-               '<p class="lg-note">If something here isn&#39;t really money between you, open it on Transactions (filter: Money between you) '
+               '<p class="lg-note">If something here isn&#39;t really money between you, open it under Manage → Fix a charge (filter: Money between you) '
                'and tick <b>Not between us</b>.</p>') if tx_rows else ""
     return (f'<div class="lg-h2">Where Aneeq&#39;s money went, {e(month_label(r["month"]))}</div>'
             f'<p class="lg-note" style="margin:0 0 8px">{sent}. It pays, in order: anything owed from earlier months, Core, Extras I, '
@@ -475,7 +475,7 @@ def person_budget(L: Ledger, mo: str, who: str) -> str:
     note += ('<p class="lg-note">Core and Extras I only. Extras II is a shared fund: see the Extras II fund on the Overview and Big expenses tabs.</p>')
     if pb["unassigned"] >= 1:
         note += (f'<p class="lg-note">{m(pb["unassigned"])} of spending this month has no person yet and isn&#39;t counted for anyone. '
-                 'Assign it on the Not in budget or Transactions tab.</p>')
+                 'Assign it under Manage → Fix a charge.</p>')
     return (f'{head}{note}<div class="lg-scroll" style="margin-top:10px"><table class="lg-table"><thead><tr><th>Line</th><th class="r">{e(name)}&#39;s budget</th>'
             f'<th class="r">Spent</th><th></th><th>Status</th></tr></thead><tbody>{"".join(out)}</tbody></table></div>')
 
@@ -719,7 +719,7 @@ def fund_planner(L: Ledger, mo: str | None = None) -> str:
         for k, v in F["planned"].items())
     plans = (f'<div class="lg-h2">Planned big-ticket items</div>'
              '<p class="lg-note" style="margin:0 0 8px">What&#39;s still expected on each (estimate less spent so far), and the month the fund '
-             'could cover it if you wait for it to refill first, one after another. Edit estimates under Manage → Big expenses.</p>'
+             'could cover it if you wait for it to refill first, one after another. Edit estimates below, under “Edit planned big expenses.”</p>'
              '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>Item</th><th class="r">Still to spend</th><th>Fund can cover it around</th></tr></thead>'
              f'<tbody>{plan_rows}</tbody></table></div>') if plan_rows else ""
     return (f'<div class="lg-h2" style="margin-top:4px">Big-ticket fund</div>'

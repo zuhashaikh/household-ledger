@@ -29,7 +29,7 @@ st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initia
 DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
 
 PAGES = ["This month", "Big-ticket fund", "Settle up", "Manage"]
-MANAGE = ["Fix charges", "Not in budget", "Budget lines", "Statements & bank sync", "Rules", "Big expenses"]
+MANAGE = ["Fix a charge", "Budget lines", "Bank sync"]
 # The three colours used everywhere: purple = Zuha, blue = Aneeq, gold = Shared.
 WHO_NAME = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq", "shared": "🟡 Shared"}
 WHO_OPTS = [""] + list(WHO_NAME.values())
@@ -354,7 +354,7 @@ def page_budget(L: Ledger, m: str, person: str = "zuha"):
                 save_config("plan", plan)
                 save_config("rules", rules)
                 st.session_state["bud-flash"] = (f"Added “{name}” ({ui.m(amt)}/month, {sec}). Charges can be put on it from the "
-                                                 "Transactions or Not in budget tab.")
+                                                 "Manage → Fix a charge.")
                 st.rerun()
     if st.session_state.get("bud-flash"):
         st.success(st.session_state.pop("bud-flash"))
@@ -362,8 +362,9 @@ def page_budget(L: Ledger, m: str, person: str = "zuha"):
 
 def page_transactions(L: Ledger, m: str, person: str):
     html(f'<div class="lg-h2" style="margin-top:4px">Transactions, {ui.e(month_label(m))}</div>')
-    show = st.radio("Show", ["All", "Needs a person", "Big expenses", "Money between you", "Not counted"],
+    show = st.radio("Show", ["All", "Not in budget", "Needs a person", "Big expenses", "Money between you", "Not counted"],
                     horizontal=True, key="txfilter")
+    budget_set = set(L.budget_lines())
     q = st.text_input("Search merchant, line or account", key="txsearch").lower()
     proj_label = {p["id"]: "★ " + p["name"] for p in L.projects}
     label_proj = {v: k for k, v in proj_label.items()}
@@ -407,6 +408,7 @@ def page_transactions(L: Ledger, m: str, person: str):
         elif L.shifted(t):
             status = f"Counts in {month_label(L.month_of(t))} (billed for next month) · " + status
         keep = {"Needs a person": not (who or ex or cb or pj), "All": True, "Big expenses": bool(pj and not cb),
+                "Not in budget": not (ex or cb or pj or sp) and c not in budget_set,
                 "Money between you": bool(cb) or bool(t.get("not_between")), "Not counted": ex}[show]
         if not keep or (q and q not in f"{t['desc']} {c} {t.get('account','')}".lower()):
             continue
@@ -595,6 +597,8 @@ def page_fund(L: Ledger, m: str | None = None):
         close_month_toggle(L, m, f"close-big-{m}")
     with st.expander("Month by month"):
         html(ui.fund_panel(L, m, table_only=True))
+    with st.expander("Edit planned big expenses: estimates, items, splits, add new"):
+        page_projects(L)
     with st.expander("Fund settings: monthly amount, start, top-ups, closed months"):
         fs = L.fund_settings()
         c0, c1, c2 = st.columns(3)
@@ -631,7 +635,7 @@ def page_fund(L: Ledger, m: str | None = None):
 def page_projects(L: Ledger):
     """Manage → Big expenses: estimates, items, splits; add a new one."""
     html('<div class="lg-h2" style="margin-top:4px">Big expenses</div><p class="lg-note" style="margin:0 0 12px">Paid from the big-ticket fund and split 50:50 unless you change it. '
-         'Tag a charge to one under Fix charges by choosing ★ in the Line column.</p>')
+         'Tag a charge to one under Manage → Fix a charge by choosing ★ in the Line column.</p>')
     for p in L.projects:
         stt = L.proj_stats(p)
         html(ui.big_card(L, p))
@@ -731,7 +735,7 @@ def run_sync(person: str) -> tuple[str, list[str]]:
             for t, r in zip(unknown, done):
                 t["category"] = r["category"]
         except Exception:  # noqa: BLE001 — leave them for the Not in budget tab
-            errs.append("Claude couldn't categorize some new charges; they're on the Not in budget tab.")
+            errs.append("Claude couldn't categorize some new charges; they're under Manage → Fix a charge (filter: Not in budget).")
     # New accounts: Chase is Zuha's, Wells Fargo is Aneeq's.
     rules, changed = LL.rules, False
     for a in {t["account"] for t in new}:
@@ -921,8 +925,8 @@ def page_rules(L: Ledger, d: dict):
                          column_config={"From": st.column_config.SelectboxColumn(options=["Aneeq", "Zuha"])})
 
     lines = L.budget_lines()
-    st.markdown("**Remembered merchants** (set from the Transactions or Not in budget tab; these win over every other rule). "
-                "Removing one here forgets it for every month; to stop it only from a month on, set its Line to — on Transactions.")
+    st.markdown("**Remembered merchants** (set under Manage → Fix a charge; these win over every other rule). "
+                "Removing one here forgets it for every month; to stop it only from a month on, set its Line to — under Fix a charge.")
     lrn = rules.get("learn") or {}
     lrdf = pd.DataFrame([{"Merchant": k, "Line": v.get("line", "") or ("★ " + pn) if (pn := {p["id"]: p["name"] for p in L.projects}.get(v.get("project"))) else v.get("line", ""),
                           "Who": WHO_NAME.get(v.get("who"), "")} for k, v in sorted(lrn.items())],
@@ -1065,7 +1069,7 @@ def main():
     top_l.markdown(ui.header(person, APP_TITLE), unsafe_allow_html=True)
     m = top_r.selectbox("Month", list(reversed(months)), format_func=month_label, key="month") if months else None
     top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload",
-                 on_click=lambda: st.session_state.update(page="Manage", manage="Statements & bank sync"))
+                 on_click=lambda: st.session_state.update(page="Manage", manage="Bank sync"))
     if st.session_state.get("page") not in PAGES + [None]:
         st.session_state["page"] = "This month"
     page = st.segmented_control("Page", PAGES, default="This month", key="page", label_visibility="collapsed") or "This month"
@@ -1085,27 +1089,25 @@ def main():
         page_statements(L, d, person)
         return
     if page == "Manage":
-        sub = st.segmented_control("Manage", MANAGE, default="Fix charges", key="manage", label_visibility="collapsed") or "Fix charges"
-        if sub == "Statements & bank sync":
+        if st.session_state.get("manage") not in MANAGE + [None]:
+            st.session_state["manage"] = "Fix a charge"
+        sub = st.segmented_control("Manage", MANAGE, default="Fix a charge", key="manage", label_visibility="collapsed") or "Fix a charge"
+        if sub == "Bank sync":
             page_statements(L, d, person)
-        elif sub == "Rules":
-            page_rules(L, d)
-        elif sub == "Big expenses":
-            page_projects(L)
         elif not m:
-            st.info("Add a statement under Statements & bank sync to get started.")
+            st.info("Add a statement or sync your banks to get started.")
         elif sub == "Budget lines":
             page_budget(L, m, person)
-        elif sub == "Not in budget":
-            page_unbudgeted(L, m)
         else:
             page_transactions(L, m, person)
+            with st.expander("Rules: accounts, store rules, merchant rules"):
+                page_rules(L, d)
     elif page == "Big-ticket fund":
         page_fund(L, m)
     elif page == "Settle up":
         page_settle(L, m)
     elif not m:
-        st.info("Add a statement under Manage → Statements & bank sync to get started.")
+        st.info("Upload a statement or sync your banks (Manage → Bank sync) to get started.")
     else:
         page_month(L, m, person)
     auto_sync(d, person)
