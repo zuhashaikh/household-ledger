@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+.data/
+seed_data.json
+__pycache__/
+*.pyc
