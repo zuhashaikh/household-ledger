@@ -1091,7 +1091,8 @@ def main():
     if page == "Manage":
         if st.session_state.get("manage") not in MANAGE + [None]:
             st.session_state["manage"] = "Fix a charge"
-        sub = st.segmented_control("Manage", MANAGE, default="Fix a charge", key="manage", label_visibility="collapsed") or "Fix a charge"
+        c_sub, _ = st.columns([1, 2])
+        sub = c_sub.selectbox("What do you want to do?", MANAGE, key="manage") or "Fix a charge"
         if sub == "Bank sync":
             page_statements(L, d, person)
         elif not m:
