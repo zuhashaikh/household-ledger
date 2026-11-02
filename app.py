@@ -411,6 +411,32 @@ def page_budget(L: Ledger, m: str, person: str = "zuha"):
         st.success(st.session_state.pop("bud-flash"))
 
 
+def plain_why(L: Ledger, t: dict, line: str, who: str | None, why: str) -> str:
+    """Why a charge sits where it does, in plain words."""
+    name = PEOPLE.get(who or "", "")
+    bits = []
+    if t.get("cat_override"):
+        bits.append(f"You put this charge on {line}")
+    elif L.learned(t).get("line"):
+        bits.append(f"{line}: remembered for this store")
+    elif L.pat_cat(t):
+        bits.append(f"{line}: store rule")
+    if not who:
+        bits.append("No person yet: pick one under Who")
+    elif why == "line owner":
+        owner = L.rules["category"].get(line)
+        bits.append(f"Shared line: half each" if owner == "shared" else f"Counts toward {name} because {line} is {name}'s line")
+    elif why == "this transaction only":
+        bits.append(f"Counts toward {name}: you set this charge")
+    elif why == "remembered for this merchant":
+        bits.append(f"Counts toward {name}: remembered for this store")
+    elif why == "merchant rule":
+        bits.append(f"Counts toward {name}: store rule")
+    elif why == "account rule":
+        bits.append(f"Counts toward {name}: everything on this account does")
+    return " · ".join(bits)
+
+
 def tx_records(L: Ledger, txns: list[dict]) -> list[dict]:
     """One editable row per charge (as stored), with what the app currently does with it."""
     proj_label = {p["id"]: "★ " + p["name"] for p in L.projects}
@@ -422,7 +448,8 @@ def tx_records(L: Ledger, txns: list[dict]) -> list[dict]:
         ex = L.is_excluded(c) and not cb and not pj
         who, why = L.resolve(t)
         if cb:
-            status = f"Money from {PEOPLE[cb['from']]}" + (f" for {pj['name']}" if pj else f" for {t['for_line']}" if t.get("for_line") else "") + " · settle-up"
+            to = "Zuha" if cb["from"] == "aneeq" else "Aneeq"
+            status = f"Money {PEOPLE[cb['from']]} sent {to}" + (f" for {pj['name']}" if pj else f" for {t['for_line']}" if t.get("for_line") else "") + " · counted in Settle up"
         elif pj:
             status = f"Big expense: {pj['name']}"
         elif sp:
@@ -434,10 +461,8 @@ def tx_records(L: Ledger, txns: list[dict]) -> list[dict]:
                       else "Not counted: moving money between your own accounts")
         elif ex:
             status = "Not counted as spending"
-        elif L.learned(t).get("line") and not t.get("cat_override"):
-            status = "Line remembered · " + why
         else:
-            status = why
+            status = plain_why(L, t, c, who, why)
         spread = L.months_paid_for(t)
         if spread:
             status += " · pays for " + ", ".join(f"{month_label(mo).split()[0]} {ui.m(a)}" for mo, a in spread)
@@ -455,7 +480,7 @@ def tx_records(L: Ledger, txns: list[dict]) -> list[dict]:
                             "Amount": t["spend"], "Line": line_val,
                             "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
                             "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False,
-                            "Not between us": bool(t.get("not_between")), "Status": status}})
+                            "Not between us": bool(t.get("not_between")), "Why": status}})
     return out
 
 
@@ -506,10 +531,10 @@ def tx_editor(L: Ledger, m: str, rows: list[dict], key: str, save_key: str, comp
         "Item": st.column_config.SelectboxColumn(options=[NO_ITEM] + items, help="Big-expense item"),
         "Only this charge": st.column_config.CheckboxColumn(help="Tick to change just this charge. Otherwise the choice is remembered for the merchant from now on."),
         "Not between us": st.column_config.CheckboxColumn(help="Tick if this was matched as money between you but isn't (e.g. a payment that just mentions Wells Fargo)."),
-        "Status": st.column_config.TextColumn(disabled=True)}
+        "Why": st.column_config.TextColumn(disabled=True, width="large", help="Why this charge is on its line and who it counts toward")}
     order = list(df.columns)
     if compact:
-        order = ["Date", "Merchant", "Paid from", "Amount", "Line", "Who", "Only this charge", "Status"]
+        order = ["Date", "Merchant", "Amount", "Paid from", "Line", "Who", "Only this charge", "Why"]
     edited = st.data_editor(df, hide_index=True, width="stretch", key=key, column_config=cols, column_order=order)
     if st.button("Save changes", type="primary", key=save_key):
         changes: dict[str, dict] = {}
