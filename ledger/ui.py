@@ -502,13 +502,13 @@ def fund_panel(L: Ledger, mo: str | None = None, compact: bool = False, table_on
             f'{"saved up" if bal >= 0 else "spent ahead of future months"}</span></div>'
             f'<div><span class="lg-eyebrow">{e(month_label(cur["month"]).split()[0])}: in / out</span>'
             f'<span class="big num">+{m(cur["x2"] + cur["leftover"] + cur["topups"])} <span class="lg-muted" style="font-size:20px">/</span> −{m(cur["regular"] + cur["big"])}</span>'
-            f'<span class="lg-muted" style="font-size:13px">{"leftover from Core &amp; Extras I counted" if cur["closed"] else "Core &amp; Extras I leftover counts once the month is closed"}</span></div>'
+            f'<span class="lg-muted" style="font-size:13px">{"leftover from Core &amp; Extras I counted" if cur["closed"] else "Core &amp; Extras I leftover counts once the month is over"}</span></div>'
             f'<div><span class="lg-eyebrow">Outlook</span>{outlook}</div></div>')
     if compact:
         return head
     trs = []
     for r in reversed(rows):
-        lo = (m(r["leftover"]) if r["closed"] else f'<span class="lg-muted" title="Counts once the month is closed">{m(max(0, r["leftover_raw"]))} pending</span>') if r["leftover_raw"] > .5 or r["closed"] else "–"
+        lo = (m(r["leftover"]) if r["closed"] else f'<span class="lg-muted" title="Counts once the month is over">{m(max(0, r["leftover_raw"]))} pending</span>') if r["leftover_raw"] > .5 or r["closed"] else "–"
         big = ", ".join(f'{e(k)} {m(v)}' for k, v in r["by_proj"].items()) or "–"
         trs.append(f'<tr><td><b>{e(month_label(r["month"]))}</b></td><td class="r num">+{m(r["x2"])}</td><td class="r num">{lo}</td>'
                    f'<td class="r num">{("+" + m(r["topups"])) if r["topups"] else "–"}</td><td class="r num">−{m(r["regular"])}</td>'
@@ -518,9 +518,8 @@ def fund_panel(L: Ledger, mo: str | None = None, compact: bool = False, table_on
             f'{m(F["everyday"])}, so about {m(F["per_month"])}/month is left for big expenses. Still planned (estimate less spent so far): {plan or "nothing"}'
             + (f'; undated top-ups {m(F["undated_topups"])}' if F["undated_topups"] else "") + '. Leftover from Core and Extras I comes on top of this.</p>')
     pending = [r for r in F["pending"]]
-    warn = ('<p class="lg-note" style="color:var(--warn)">Close a month (below the table) once both of you have all its statements in. '
-            'Until then its Core and Extras I leftover isn&#39;t counted, because missing statements (e.g. Aneeq&#39;s rent) would make it look far bigger than it is.</p>'
-            if pending else "")
+    warn = ('<p class="lg-note">The current month&#39;s Core and Extras I leftover is added once the month is over. Statements that come in '
+            'later still update it.</p>' if pending else "")
     if table_only:
         head = proj = ""
     return (head + proj + warn +
@@ -705,14 +704,14 @@ def fund_planner(L: Ledger, mo: str | None = None) -> str:
             f'<span class="lg-muted" style="font-size:13px">{"saved up" if bal >= 0 else "spent ahead of future months"}</span></div>'
             f'<div><span class="lg-eyebrow">Refills by</span><span class="big num">{m(pm)}<span style="font-size:16px;color:var(--muted)">/month</span></span>'
             f'<span class="lg-muted" style="font-size:13px">{m(F["std"])} goes in · everyday Extras II has averaged {m(F["everyday"])} · '
-            'plus Regulars leftover in closed months</span></div>'
+            'plus Regulars leftover once each month is over</span></div>'
             f'<div><span class="lg-eyebrow">Back to $0</span><span class="big">{btz_txt}</span>'
             f'<span class="lg-muted" style="font-size:13px">{btz_sub}</span></div></div>')
     faster = ""
     if bal < 0 and pm > 0:
         import math
         alt = [(x, math.ceil(-bal / (pm + x))) for x in (250, 500, 1000)]
-        faster = ('<p class="lg-note">Each month you come in under on Regulars and close the month, the leftover goes in too: '
+        faster = ('<p class="lg-note">Each month you come in under on Regulars, the leftover goes in too once the month is over: '
                   + " · ".join(f'{m(x)}/month under → about {n} month{"s" if n != 1 else ""}' for x, n in alt)
                   + f' (vs about {math.ceil(-bal / pm)} without).</p>')
     plan_rows = "".join(

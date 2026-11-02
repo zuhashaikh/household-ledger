@@ -184,13 +184,26 @@ def html(x: str):
 
 
 def close_month_toggle(L: Ledger, m: str, key: str):
-    fs = L.fund_settings()
-    closed = m in fs["closed"]
-    val = st.checkbox(f"All of {month_label(m)}'s statements are in: count its Core and Extras I leftover toward the Extras II fund",
-                      value=closed, key=key)
+    """Past months count as closed on their own (late statements still update them); this lets you close the
+    current month early, or keep a past month open while its statements are still missing."""
+    import datetime as _dt
+    past = m < _dt.date.today().strftime("%Y-%m")
+    closed = L.is_closed(m)
+    label = (f"Count {month_label(m)}'s Core and Extras I leftover toward the big-ticket fund"
+             + (" (on automatically now that the month is over; untick if statements are still missing)" if past else " now (it's added automatically once the month is over)"))
+    miss = L.missing_statements(m) if past and m not in (L.fund_settings().get("open") or []) else []
+    if miss and not closed:
+        label = (f"Count {month_label(m)}'s Core and Extras I leftover toward the big-ticket fund "
+                 f"(waiting: nothing from {' or '.join(PEOPLE[w] + chr(39) + 's accounts' for w in miss)} this month yet)")
+    val = st.checkbox(label, value=closed, key=key)
     if val != closed:
         f = fresh()[1].fund_settings()
-        f["closed"] = sorted(set(f["closed"]) | {m}) if val else [x for x in f["closed"] if x != m]
+        f["closed"] = [x for x in f["closed"] if x != m] + ([m] if val and (not past or miss) else [])
+        f["open"] = [x for x in (f.get("open") or []) if x != m] + ([m] if past and not val else [])
+        f.pop("monthly_auto", None)
+        if f.get("monthly") and abs(float(f["monthly"]) - sum(float(v or 0) for c, v in L.plan["budgets"].items()
+                                                              if L.plan["groups"].get(c) == DEFAULT_SECTION and not L.is_excluded(c))) < .5:
+            f.pop("monthly")  # keep following the budget sheet unless it was set by hand
         save_config("fund", f)
         st.rerun()
 
@@ -597,7 +610,7 @@ def page_fund(L: Ledger, m: str | None = None):
                              column_config={"Month": st.column_config.TextColumn(help="YYYY-MM, or blank if not yet received"),
                                             "Whose money": st.column_config.SelectboxColumn(options=["🟣 Zuha", "🔵 Aneeq"]),
                                             "Amount": st.column_config.NumberColumn(format="$%.2f")})
-        closed = st.multiselect("Closed months (all statements in)", L.months(), default=[x for x in fs["closed"] if x in L.months()],
+        closed = st.multiselect("Months closed early (past months close on their own)", L.months(), default=[x for x in fs["closed"] if x in L.months()],
                                 format_func=month_label, key="f-closed")
         if st.button("Save fund settings", type="primary", key="f-save"):
             import re as _re
@@ -605,7 +618,7 @@ def page_fund(L: Ledger, m: str | None = None):
                 st.error("Start month must look like 2026-09.")
             else:
                 std = sum(float(v or 0) for c, v in L.plan["budgets"].items() if L.plan["groups"].get(c) == DEFAULT_SECTION and not L.is_excluded(c))
-                save_config("fund", {"start": start.strip(), "opening": float(opening or 0), "closed": sorted(closed),
+                save_config("fund", {"start": start.strip(), "opening": float(opening or 0), "closed": sorted(closed), "open": fs.get("open") or [],
                                      **({"monthly": float(monthly)} if abs(float(monthly) - std) >= .5 else {}),
                                      "topups": [{"month": str(r["Month"] or "").strip(), "who": {"🟣 Zuha": "zuha", "🔵 Aneeq": "aneeq"}.get(r["Whose money"]),
                                                  "amount": float(r["Amount"] or 0), "note": str(r["Note"] or "")}

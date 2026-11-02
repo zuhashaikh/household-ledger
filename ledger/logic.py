@@ -788,6 +788,23 @@ class Ledger:
         y, mo = int(m[:4]), int(m[5:7]) + 1
         return f"{y + (mo > 12)}-{(mo - 1) % 12 + 1:02d}"
 
+    def is_closed(self, m: str) -> bool:
+        """A month is closed once it's over, unless you've kept it open; you can also close the current month early.
+        Closing only decides when Core and Extras I leftover goes into the fund. Late statements still update it."""
+        import datetime as _dt
+        fs = self.fund_settings()
+        if m in (fs.get("open") or []):
+            return False
+        if m in fs["closed"]:
+            return True
+        return m < _dt.date.today().strftime("%Y-%m") and not self.missing_statements(m)
+
+    def missing_statements(self, m: str) -> list[str]:
+        """Whose accounts have nothing at all in month m (then its leftover would look far too big)."""
+        have = {self.payer_of(t) for t in self.month_txns(m, with_deductions=False, split=False)}
+        known = {w for w in self.rules["payer"].values() if w in ("zuha", "aneeq")}
+        return [w for w in ("zuha", "aneeq") if w in known and w not in have]
+
     def fund_month(self, m: str) -> dict:
         """One month of the Extras II (big-ticket) fund. Money in: the same fixed amount every month (one-off
         allotments in the budget sheet don't count as money in), plus Core and Extras I leftover once the month is
@@ -805,7 +822,7 @@ class Ledger:
         big = sum(v for k, r in sm.items() if k.startswith("big:") for v in r.values())
         by_proj = {p["name"]: sum(sm.get("proj:" + p["id"], {}).values()) for p in self.projects if sm.get("proj:" + p["id"])}
         tops = [t for t in fs["topups"] if str(t.get("month") or "") == m]
-        closed = m in fs["closed"]
+        closed = self.is_closed(m)
         lo = max(0.0, leftover) if closed else 0.0
         return {"month": m, "x2": x2, "leftover_raw": leftover, "leftover": lo, "closed": closed,
                 "topups": sum(float(t.get("amount") or 0) for t in tops), "regular": regular, "big": big, "by_proj": by_proj,
