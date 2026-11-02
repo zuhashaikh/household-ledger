@@ -1086,12 +1086,9 @@ def main():
     nav = st.container(horizontal=True, vertical_alignment="center", gap=None, key="nav")
     for p in MAIN:
         nav.button(p, key=f"nav-{p}", type="primary" if page == p else "secondary", on_click=go, args=(p,))
-    st.session_state["mg-select"] = st.session_state["manage"] if page == "Manage" else None
-    nav.selectbox("Manage", MANAGE, key="mg-select", placeholder="Manage", label_visibility="collapsed", width=170,
-                  on_change=lambda: go("Manage", st.session_state["mg-select"]) if st.session_state.get("mg-select") else None)
-    if page == "Manage":  # show the Manage menu as the selected tab
-        html('<style>.st-key-nav [data-baseweb="select"]>div,.st-key-nav [data-testid="stSelectbox"]>div>div{background:var(--surface)!important;color:var(--ink)!important;'
-             'box-shadow:0 1px 2px rgba(28,35,32,.14)!important}</style>')
+    for sub in MANAGE:
+        nav.button(sub, key=f"nav-{sub}", type="primary" if page == "Manage" and st.session_state["manage"] == sub else "secondary",
+                   on_click=go, args=("Manage", sub))
 
     with st.sidebar:
         st.markdown(f"**{PEOPLE.get(person, person)}**  \n{email if email != 'local' else 'Local test mode'}")
