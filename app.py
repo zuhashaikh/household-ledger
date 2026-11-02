@@ -29,6 +29,7 @@ st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initia
 DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
 
 PAGES = ["This month", "Big-ticket fund", "Settle up", "Manage"]
+MAIN = PAGES[:3]
 MANAGE = ["Fix a charge", "Budget lines", "Bank sync"]
 # The three colours used everywhere: purple = Zuha, blue = Aneeq, gold = Shared.
 WHO_NAME = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq", "shared": "🟡 Shared"}
@@ -1057,6 +1058,13 @@ def page_setup(d: dict):
 
 
 # ---------------------------------------------------------------- main
+def go(page: str, sub: str | None = None):
+    """Switch page (and Manage section)."""
+    st.session_state["page"] = page
+    if sub:
+        st.session_state["manage"] = sub
+
+
 def main():
     html(ui.CSS)
     person, email = current_person()
@@ -1068,11 +1076,20 @@ def main():
     top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
     top_l.markdown(ui.header(person, APP_TITLE), unsafe_allow_html=True)
     m = top_r.selectbox("Month", list(reversed(months)), format_func=month_label, key="month") if months else None
-    top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload",
-                 on_click=lambda: st.session_state.update(page="Manage", manage="Bank sync"))
-    if st.session_state.get("page") not in PAGES + [None]:
+    top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload", on_click=go, args=("Manage", "Bank sync"))
+    if st.session_state.get("page") not in PAGES:
         st.session_state["page"] = "This month"
-    page = st.segmented_control("Page", PAGES, default="This month", key="page", label_visibility="collapsed") or "This month"
+    if st.session_state.get("manage") not in MANAGE:
+        st.session_state["manage"] = "Fix a charge"
+    page = st.session_state["page"]
+    st.session_state["nav"] = page if page in MAIN else None
+    nav = st.container(horizontal=True, vertical_alignment="center", gap="small")
+    nav.segmented_control("Page", MAIN, key="nav", label_visibility="collapsed",
+                          on_change=lambda: go(st.session_state.get("nav") or st.session_state["page"]))
+    st.session_state["mg-select"] = st.session_state["manage"] if page == "Manage" else None
+    nav.selectbox("Manage", MANAGE, key="mg-select", placeholder="Manage ▾", label_visibility="collapsed", width=210,
+                  format_func=lambda x: f"Manage: {x}",
+                  on_change=lambda: go("Manage", st.session_state["mg-select"]) if st.session_state.get("mg-select") else None)
 
     with st.sidebar:
         st.markdown(f"**{PEOPLE.get(person, person)}**  \n{email if email != 'local' else 'Local test mode'}")
@@ -1089,10 +1106,7 @@ def main():
         page_statements(L, d, person)
         return
     if page == "Manage":
-        if st.session_state.get("manage") not in MANAGE + [None]:
-            st.session_state["manage"] = "Fix a charge"
-        c_sub, _ = st.columns([1, 2])
-        sub = c_sub.selectbox("What do you want to do?", MANAGE, key="manage") or "Fix a charge"
+        sub = st.session_state["manage"]
         if sub == "Bank sync":
             page_statements(L, d, person)
         elif not m:
