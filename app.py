@@ -237,7 +237,7 @@ def page_month(L: Ledger, m: str, person: str = "zuha"):
                 if raw_ids:
                     byid = {t["id"]: t for t in L.txns}
                     tx_editor(L, m, tx_records(L, [byid[i] for i in raw_ids if i in byid]),
-                              key=f"ln-{m}-{ln['cat']}", save_key=f"save-ln-{m}-{ln['cat']}", compact=True)
+                              key=f"ln-{m}-{ln['cat']}", save_key=f"save-ln-{m}-{ln['cat']}", compact=True, in_line=True)
                 elif not synth:
                     html('<p class="lg-note" style="margin:4px 0">No charges on this line this month.</p>')
     html('<div class="lg-h2">Other charges</div><p class="lg-note" style="margin:0 0 8px">Charges that aren&#39;t on a budget line, '
@@ -471,6 +471,22 @@ def tx_records(L: Ledger, txns: list[dict]) -> list[dict]:
             status = f"Refund of the {orig['date']} charge · counts in {month_label(L.month_of(orig))} · " + status
         elif L.shifted(t):
             status = f"Counts in {month_label(L.month_of(t))} (billed for next month) · " + status
+        # Note: only what's unusual about a charge, for the lists inside each budget line
+        note = []
+        if sp:
+            note.append("Split: " + ", ".join(f"{x['cat_override']} {ui.m(x['spend'])}" for x in sp))
+        if spread:
+            note.append("Covers " + ", ".join(f"{month_label(mo).split()[0]} {ui.m(a)}" for mo, a in spread))
+        if orig:
+            note.append(f"Refund of the {orig['date']} charge")
+        elif L.shifted(t):
+            note.append(f"Counts in {month_label(L.month_of(t))}")
+        if t.get("cat_override") and t.get("cat_override") != DONT_COUNT:
+            note.append("You moved it to this line")
+        if t.get("person") and who:
+            note.append(f"You set it to count toward {PEOPLE.get(who, who)}")
+        elif not who and not (cb or pj or ex):
+            note.append("Pick a person under Who")
         line_val = proj_label.get(pj["id"]) if pj else ((t.get("for_line") or NO_LINE) if cb else (NO_LINE if sp else c))
         if t.get("cat_override") == DONT_COUNT:
             line_val, status = "🚫 " + DONT_COUNT, "Not counted (you chose this) · set a Line to count it again"
@@ -480,7 +496,7 @@ def tx_records(L: Ledger, txns: list[dict]) -> list[dict]:
                             "Amount": t["spend"], "Line": line_val,
                             "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
                             "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False,
-                            "Not between us": bool(t.get("not_between")), "Why": status}})
+                            "Not between us": bool(t.get("not_between")), "Why": status, "Note": "; ".join(note)}})
     return out
 
 
@@ -513,7 +529,7 @@ def page_transactions(L: Ledger, m: str, person: str):
         st.success(st.session_state.pop("flash"))
 
 
-def tx_editor(L: Ledger, m: str, rows: list[dict], key: str, save_key: str, compact: bool = False):
+def tx_editor(L: Ledger, m: str, rows: list[dict], key: str, save_key: str, compact: bool = False, in_line: bool = False):
     """The editable charges table and its Save button."""
     proj_label = {p["id"]: "★ " + p["name"] for p in L.projects}
     label_proj = {v: k for k, v in proj_label.items()}
@@ -523,7 +539,7 @@ def tx_editor(L: Ledger, m: str, rows: list[dict], key: str, save_key: str, comp
     df = pd.DataFrame([r["rec"] for r in rows])
     cols = {
         "Date": st.column_config.TextColumn(disabled=True, width="small"),
-        "Merchant": st.column_config.TextColumn(disabled=True, width="large"),
+        "Merchant": st.column_config.TextColumn(disabled=True, width="medium"),
         "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
         "Amount": st.column_config.NumberColumn(format="dollar", disabled=True, width="small"),
         "Line": st.column_config.SelectboxColumn(options=line_opts, help="Budget line, ★ a big expense, or 🚫 Don't count"),
@@ -531,10 +547,13 @@ def tx_editor(L: Ledger, m: str, rows: list[dict], key: str, save_key: str, comp
         "Item": st.column_config.SelectboxColumn(options=[NO_ITEM] + items, help="Big-expense item"),
         "Only this charge": st.column_config.CheckboxColumn(help="Tick to change just this charge. Otherwise the choice is remembered for the merchant from now on."),
         "Not between us": st.column_config.CheckboxColumn(help="Tick if this was matched as money between you but isn't (e.g. a payment that just mentions Wells Fargo)."),
-        "Why": st.column_config.TextColumn(disabled=True, width="large", help="Why this charge is on its line and who it counts toward")}
+        "Why": st.column_config.TextColumn(disabled=True, width="large", help="Why this charge is here and who it counts toward"),
+        "Note": st.column_config.TextColumn(disabled=True, width="large", help="Anything unusual about this charge")}
     order = list(df.columns)
     if compact:
-        order = ["Date", "Merchant", "Amount", "Paid from", "Line", "Who", "Only this charge", "Why"]
+        order = ["Date", "Merchant", "Amount", "Paid from", "Line", "Who", "Only this charge", "Note" if in_line else "Why"]
+    else:
+        order = [c for c in order if c != "Note"]
     edited = st.data_editor(df, hide_index=True, width="stretch", key=key, column_config=cols, column_order=order)
     if st.button("Save changes", type="primary", key=save_key):
         changes: dict[str, dict] = {}
@@ -647,7 +666,7 @@ def page_unbudgeted(L: Ledger, m: str | None):
     ids = [t["id"] for t, _ in rows]
     ed = st.data_editor(df, hide_index=True, width="stretch", key=f"nib-{scope}-{m}",
                         column_config={"Date": st.column_config.TextColumn(disabled=True, width="small"),
-                                       "Merchant": st.column_config.TextColumn(disabled=True, width="large"),
+                                       "Merchant": st.column_config.TextColumn(disabled=True, width="medium"),
                                        "Amount": st.column_config.NumberColumn(format="dollar", disabled=True, width="small"),
                                        "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
                                        "Account": st.column_config.TextColumn(disabled=True),
