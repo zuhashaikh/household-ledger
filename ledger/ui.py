@@ -34,7 +34,7 @@ h1,h2,h3{font-family:var(--display)!important;letter-spacing:-.01em;color:var(--
 .lg-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:6px 0 4px}
 .lg-summary>div{background:var(--surface);padding:16px 18px;display:flex;flex-direction:column;gap:4px;min-width:0}
 .lg-summary .big{font-family:var(--display);font-size:28px;font-weight:700;color:var(--ink);line-height:1.1}
-@media (max-width:640px){.lg-summary{grid-template-columns:1fr}}
+@media (max-width:640px){.lg-summary{grid-template-columns:1fr!important}}
 
 .lg-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
 .lg-table{border-collapse:collapse;width:100%;font-size:14px;color:var(--ink);margin:0!important;border:0!important}
@@ -114,7 +114,10 @@ def summary(L: Ledger, mo: str) -> str:
         sub = f'{bank} {m(total - pay[who])} · {m(pay[who])} taken from pay' if pay[who] else f'From {bank}'
         return (f'<div><span class="lg-eyebrow"><span class="dot d-{who}"></span>Spent by {name}</span>'
                 f'<span class="big num">{m(total)}</span><span class="lg-muted num" style="font-size:13px">{sub}</span></div>')
-    return ('<div class="lg-summary">' + cell("zuha", "Zuha", "Chase") + cell("aneeq", "Aneeq", "Wells Fargo")
+    hh = sum(res["paid"].values())
+    hh_cell = (f'<div><span class="lg-eyebrow">Household spent</span><span class="big num">{m(hh)}</span>'
+               f'<span class="lg-muted" style="font-size:13px">{e(month_label(mo).split()[0])} · both accounts, no transfers or card payments</span></div>')
+    return ('<div class="lg-summary" style="grid-template-columns:repeat(4,minmax(0,1fr))">' + hh_cell + cell("zuha", "Zuha", "Chase") + cell("aneeq", "Aneeq", "Wells Fargo")
             + (f'<div><span class="lg-eyebrow">Aneeq owes Zuha</span><span class="big num" style="color:var(--zuha)">{m(owed if owed >= 1 else 0)}</span>'
                if owed > -1 else
                f'<div><span class="lg-eyebrow">Aneeq&#39;s credit</span><span class="big num" style="color:var(--aneeq)">{m(-owed)}</span>')
@@ -544,10 +547,11 @@ def budget_cards(L: Ledger, mo: str) -> str:
         reg_note = ""
     reg_card = (f'<div class="lg-card"><span class="lg-eyebrow">Regulars · Core + Extras I</span>'
                 f'<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
-                f'<span class="hero num">{m(reg_tot)} <small>of {m(reg_bud)}</small></span>{reg_pill}</div>'
-                f'{bar(reg, reg_bud, reg_tot)}<div style="font-size:13px">{payers(reg)}</div>{reg_note}'
-                f'<div class="rowline"><span>Core</span><span><b class="num">{m(sum(core.values()))}</b> of {m(bud.get("Home Budget", 0))}</span></div>'
-                f'<div class="rowline"><span>Extras I</span><span><b class="num">{m(sum(x1.values()))}</b> of {m(bud.get("Extras I", 0))}</span></div>'
+                f'<span class="hero num">{m(reg_tot)} <small>spent</small></span></div>'
+                f'<div title="Full bar = this month&#39;s Core + Extras I budget">{bar(reg, reg_bud, reg_tot)}</div>'
+                f'<div style="font-size:13px">{payers(reg)}</div>'
+                f'<div class="rowline"><span>Core</span><span><b class="num">{m(sum(core.values()))}</b></span></div>'
+                f'<div class="rowline"><span>Extras I</span><span><b class="num">{m(sum(x1.values()))}</b></span></div>'
                 + (f'<div class="rowline"><span>Not on a budget line</span><span><b class="num">{m(other)}</b> · see Not in budget</span></div>' if abs(other) >= .5 else "")
                 + details + '</div>')
 
@@ -583,5 +587,5 @@ def budget_cards(L: Ledger, mo: str) -> str:
                f'{" (it already includes the regulars leftover)" if closed else ""}</span></span>'
                f'<span class="hero num" style="font-family:var(--display);font-size:26px;font-weight:700;color:var(--{"good" if net >= 0 else "bad"})">'
                f'{m(abs(net))} {"ahead" if net >= 0 else "behind"}</span></div>')
-    return f'<div class="lg-two">{reg_card}{x2_card}</div>{overall}'
+    return f'<div class="lg-two">{reg_card}{x2_card}</div><p class="lg-note">The Regulars bar fills toward this month&#39;s Core + Extras I budget.</p>'
 
