@@ -28,7 +28,8 @@ st.set_page_config(page_title=APP_TITLE, page_icon="💳", layout="wide", initia
 # Who may sign in. [people] in the secrets overrides this.
 DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"}
 
-PAGES = ["Overview", "Budget", "Transactions", "Not in budget", "Big expenses", "Settle up", "Statements", "Rules"]
+PAGES = ["This month", "Big-ticket fund", "Settle up", "Manage"]
+MANAGE = ["Fix charges", "Not in budget", "Budget lines", "Statements & bank sync", "Rules", "Big expenses"]
 # The three colours used everywhere: purple = Zuha, blue = Aneeq, gold = Shared.
 WHO_NAME = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq", "shared": "🟡 Shared"}
 WHO_OPTS = [""] + list(WHO_NAME.values())
@@ -194,26 +195,26 @@ def close_month_toggle(L: Ledger, m: str, key: str):
         st.rerun()
 
 
-def page_overview(L: Ledger, m: str):
+def page_month(L: Ledger, m: str, person: str = "zuha"):
+    """This month: totals, Regulars and Extras II at a glance, then every budget line with its charges."""
     html(ui.summary(L, m))
-    html(f'<div class="lg-h2">Are we on budget? {ui.e(month_label(m))}</div>')
     html(ui.budget_cards(L, m))
     close_month_toggle(L, m, f"close-ov-{m}")
-    with st.expander("Detail: by section and account"):
-        html(ui.sections(L, m))
-
-
-def page_budget(L: Ledger, m: str, person: str = "zuha"):
-    t_line, t_person, t_edit = st.tabs(["By line", "By person", "Edit or add lines"])
-    with t_line:
-        html(ui.budget(L, m).replace('<div class="lg-h2">', '<div class="lg-h2" style="margin-top:4px">', 1))
-    with t_person:
-        html(f'<div class="lg-h2" style="margin-top:4px">Budget check by person, {ui.e(month_label(m))}</div>')
+    html(ui.budget(L, m))
+    with st.expander("Budget check by person"):
         names = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}
         who_label = st.segmented_control("Person", list(names.values()), default=names.get(person, names["zuha"]),
                                          key="budget-person", label_visibility="collapsed") or names.get(person, names["zuha"])
         who = next(k for k, v in names.items() if v == who_label)
         html(ui.person_budget(L, m, who))
+    with st.expander("Detail: by section and account"):
+        html(ui.sections(L, m))
+
+
+def page_budget(L: Ledger, m: str, person: str = "zuha"):
+    """Manage → Budget lines: edit amounts, sections and owners; rename; add."""
+    html(f'<div class="lg-h2" style="margin-top:4px">Budget lines, {ui.e(month_label(m))}</div>')
+    t_edit = st.container()
     own = m in L.plan["byMonth"]
     rows = L.budget_rows(m)
     SEC_LABEL = {k: l for k, l in SECTIONS}
@@ -569,16 +570,18 @@ def page_unbudgeted(L: Ledger, m: str | None):
         st.success(st.session_state.pop("nib-flash"))
 
 
-def page_big(L: Ledger, m: str | None = None):
-    html('<div class="lg-h2" style="margin-top:4px">Extras II fund</div><p class="lg-note" style="margin:0 0 10px">Each month the fund gets that month&#39;s '
-         'Extras II budget, plus whatever was left on Core and Extras I once the month is closed. Everyday Extras II spending and big expenses '
-         'come out of it. Unspent money stays in the fund; a negative balance is paid back by future months.</p>')
-    html(ui.fund_panel(L, m))
+def page_fund(L: Ledger, m: str | None = None):
+    """The big-ticket planner: where the fund stands, when it's back to $0, and when each planned expense fits."""
+    html(ui.fund_planner(L, m))
     if m:
         close_month_toggle(L, m, f"close-big-{m}")
-    with st.expander("Fund settings: start, top-ups, closed months"):
+    with st.expander("Month by month"):
+        html(ui.fund_panel(L, m, table_only=True))
+    with st.expander("Fund settings: monthly amount, start, top-ups, closed months"):
         fs = L.fund_settings()
-        c1, c2 = st.columns(2)
+        c0, c1, c2 = st.columns(3)
+        monthly = c0.number_input("Goes in every month", value=float(fs["monthly"] or 0), step=50.0, key="f-monthly",
+                                  help="Default: the standard Extras II budget. One-off amounts in the budget sheet don't count as money in.")
         start = c1.text_input("Fund starts (YYYY-MM)", value=fs["start"], key="f-start")
         opening = c2.number_input("Balance at the start", value=float(fs["opening"] or 0), step=50.0, key="f-open")
         st.markdown("**Top-ups** (money put into the fund from outside the monthly budget, e.g. Aneeq's Roth). Leave Month blank for planned ones; they count in the outlook only.")
@@ -596,15 +599,21 @@ def page_big(L: Ledger, m: str | None = None):
             if not _re.fullmatch(r"\d{4}-\d{2}", start.strip()):
                 st.error("Start month must look like 2026-09.")
             else:
+                std = sum(float(v or 0) for c, v in L.plan["budgets"].items() if L.plan["groups"].get(c) == DEFAULT_SECTION and not L.is_excluded(c))
                 save_config("fund", {"start": start.strip(), "opening": float(opening or 0), "closed": sorted(closed),
+                                     **({"monthly": float(monthly)} if abs(float(monthly) - std) >= .5 else {}),
                                      "topups": [{"month": str(r["Month"] or "").strip(), "who": {"🟣 Zuha": "zuha", "🔵 Aneeq": "aneeq"}.get(r["Whose money"]),
                                                  "amount": float(r["Amount"] or 0), "note": str(r["Note"] or "")}
                                                 for _, r in ted.iterrows() if float(r["Amount"] or 0)]})
                 st.success("Saved.")
                 st.rerun()
 
-    html('<div class="lg-h2">Big expenses</div><p class="lg-note" style="margin:0 0 12px">Paid from the Extras II fund and split 50:50 unless you change it. '
-         'Tag a charge to one from Transactions by choosing ★ in the Line column.</p>')
+
+
+def page_projects(L: Ledger):
+    """Manage → Big expenses: estimates, items, splits; add a new one."""
+    html('<div class="lg-h2" style="margin-top:4px">Big expenses</div><p class="lg-note" style="margin:0 0 12px">Paid from the big-ticket fund and split 50:50 unless you change it. '
+         'Tag a charge to one under Fix charges by choosing ★ in the Line column.</p>')
     for p in L.projects:
         stt = L.proj_stats(p)
         html(ui.big_card(L, p))
@@ -1038,8 +1047,10 @@ def main():
     top_l.markdown(ui.header(person, APP_TITLE), unsafe_allow_html=True)
     m = top_r.selectbox("Month", list(reversed(months)), format_func=month_label, key="month") if months else None
     top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload",
-                 on_click=lambda: st.session_state.update(page="Statements"))
-    page = st.segmented_control("Page", PAGES, default="Overview", key="page", label_visibility="collapsed") or "Overview"
+                 on_click=lambda: st.session_state.update(page="Manage", manage="Statements & bank sync"))
+    if st.session_state.get("page") not in PAGES + [None]:
+        st.session_state["page"] = "This month"
+    page = st.segmented_control("Page", PAGES, default="This month", key="page", label_visibility="collapsed") or "This month"
 
     with st.sidebar:
         st.markdown(f"**{PEOPLE.get(person, person)}**  \n{email if email != 'local' else 'Local test mode'}")
@@ -1053,26 +1064,32 @@ def main():
 
     if not d["txns"] and not d["config"]:
         page_setup(d)
-        if page != "Statements":
-            return
-    if page == "Statements":
         page_statements(L, d, person)
-    elif page == "Rules":
-        page_rules(L, d)
-    elif page == "Big expenses":
-        page_big(L, m)
+        return
+    if page == "Manage":
+        sub = st.segmented_control("Manage", MANAGE, default="Fix charges", key="manage", label_visibility="collapsed") or "Fix charges"
+        if sub == "Statements & bank sync":
+            page_statements(L, d, person)
+        elif sub == "Rules":
+            page_rules(L, d)
+        elif sub == "Big expenses":
+            page_projects(L)
+        elif not m:
+            st.info("Add a statement under Statements & bank sync to get started.")
+        elif sub == "Budget lines":
+            page_budget(L, m, person)
+        elif sub == "Not in budget":
+            page_unbudgeted(L, m)
+        else:
+            page_transactions(L, m, person)
+    elif page == "Big-ticket fund":
+        page_fund(L, m)
     elif page == "Settle up":
         page_settle(L, m)
     elif not m:
-        st.info("Add a statement on the Statements page to get started.")
-    elif page == "Overview":
-        page_overview(L, m)
-    elif page == "Budget":
-        page_budget(L, m, person)
-    elif page == "Not in budget":
-        page_unbudgeted(L, m)
-    elif page == "Transactions":
-        page_transactions(L, m, person)
+        st.info("Add a statement under Manage → Statements & bank sync to get started.")
+    else:
+        page_month(L, m, person)
     auto_sync(d, person)
 
 

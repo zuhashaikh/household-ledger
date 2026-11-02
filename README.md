@@ -2,13 +2,10 @@
 
 A private web app where Zuha and Aneeq each sign in with Google, upload PDF bank and card statements, and see the same up-to-date ledger:
 
-- **Overview**: spent from Chase (Zuha), spent from Wells Fargo (Aneeq), what's owed to Zuha, and spending by Core / Extras I / Extras II per account, with each big expense named.
-- **Budget**: every line against the monthly plan from the budget sheet, net of money set aside for big expenses. Budget amounts are editable.
-- **Transactions**: change a charge's line, tag it to a ★ big expense and item, override who it counts toward, or make a rule for a merchant.
-- **Big expenses**: estimated and spent so far (from statements), overall and per item, plus how each is funded.
-- **Settle up**: month by month and a running balance.
-- **Statements**: upload PDFs; Claude reads them, you confirm, and the original PDF is kept in Google Drive.
-- **Rules**: accounts and who pays them, transfers between you, store rules (Costco/Walmart/H-E-B/Kroger → Grocery), merchant rules, line owners.
+- **This month**: household total, spent by Zuha (Chase) and Aneeq (Wells Fargo), what Aneeq owes; Regulars (Core + Extras I) and Extras II at a glance; every budget line with its charges.
+- **Big-ticket fund**: a fixed amount goes in every month, actual Extras II and big-expense spending comes out. Shows the balance, when it's back to $0, and when each planned big expense fits.
+- **Settle up**: what Aneeq owes Zuha, month by month.
+- **Manage**: fix charges, Not in budget, budget lines (edit, rename, add), statements and bank sync, rules, big expenses.
 
 Spending comes only from statements. Budgets and estimates come only from the budget sheet.
 

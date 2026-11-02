@@ -253,10 +253,10 @@ def budget(L: Ledger, mo: str) -> str:
         if g != last:
             last = g
             gs = sum(x["all"] for x in by_group[g])
-            gb = sum(x["available"] for x in by_group[g])
+            gb = sum(x["available"] for x in by_group[g]) if g != DEFAULT_SECTION else 0
             label = dict(SECTIONS).get(g, g)
             out.append(f'<tr class="grp"><td colspan="5"><span class="lg-eyebrow">{e(label)}</span> <span class="lg-muted num" style="font-size:13px;margin-left:8px">{m(gs)} spent{(" of " + m(gb)) if gb else ""}</span></td></tr>')
-        b = r["available"]
+        b = r["available"] if g != DEFAULT_SECTION else 0.0
         paid = r["paid"]
         scale = max(b, r["all"], 1)
         x, segs = 0.0, ""
@@ -281,7 +281,9 @@ def budget(L: Ledger, mo: str) -> str:
             amt = paid.get(other, 0) + paid.get("shared", 0) / 2
             if amt >= .5:
                 cross += (f'<span class="why" style="color:var(--{other})"><b>{PEOPLE[other]} paid {m(amt)}</b> of {PEOPLE[owner]}&#39;s line</span>')
-        if not b and not r["all"]:
+        if g == DEFAULT_SECTION:
+            st = ""
+        elif not b and not r["all"]:
             st = '<span class="pill nobud">No budget</span>'
         elif not b:
             st = '<span class="pill over">no budget</span>'
@@ -290,7 +292,7 @@ def budget(L: Ledger, mo: str) -> str:
         ch = charges.get(r["cat"], [])
         name = (f'<details class="lc"><summary><b>{e(r["cat"])}</b> <span class="lg-muted" style="font-size:12px">· {len(ch)} charge{"s" if len(ch) != 1 else ""}</span>{own}</summary>'
                 f'<div class="chs">{_charge_list(L, ch, raw)}</div></details>' if ch else f'<b>{e(r["cat"])}</b>{own}')
-        out.append(f'<tr><td style="min-width:260px">{name}</td><td class="r num">{m(r["planned"]) if r["planned"] else "–"}</td>'
+        out.append(f'<tr><td style="min-width:260px">{name}</td><td class="r num">{m(r["planned"]) if r["planned"] and g != DEFAULT_SECTION else "–"}</td>'
                    f'<td class="r num"><b>{m(r["all"])}</b></td>'
                    + (f'<td style="min-width:220px"><div class="bar {"over" if b and r["all"] > b else ""}">{segs}</div>'
                       f'<div style="margin-top:4px;font-size:13px">{payers}</div>{cross}</td>' if payers else '<td></td>')
@@ -478,7 +480,7 @@ def person_budget(L: Ledger, mo: str, who: str) -> str:
             f'<th class="r">Spent</th><th></th><th>Status</th></tr></thead><tbody>{"".join(out)}</tbody></table></div>')
 
 
-def fund_panel(L: Ledger, mo: str | None = None, compact: bool = False) -> str:
+def fund_panel(L: Ledger, mo: str | None = None, compact: bool = False, table_only: bool = False) -> str:
     F = L.fund()
     rows = F["rows"]
     if not rows:
@@ -519,9 +521,11 @@ def fund_panel(L: Ledger, mo: str | None = None, compact: bool = False) -> str:
     warn = ('<p class="lg-note" style="color:var(--warn)">Close a month (below the table) once both of you have all its statements in. '
             'Until then its Core and Extras I leftover isn&#39;t counted, because missing statements (e.g. Aneeq&#39;s rent) would make it look far bigger than it is.</p>'
             if pending else "")
+    if table_only:
+        head = proj = ""
     return (head + proj + warn +
-            '<div class="lg-scroll" style="margin-top:10px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Extras II budget</th>'
-            '<th class="r">Core &amp; Extras I leftover</th><th class="r">Top-ups</th><th class="r">Everyday Extras II</th><th>Big expenses</th><th class="r">Fund balance</th></tr></thead>'
+            '<div class="lg-scroll" style="margin-top:10px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Goes in</th>'
+            '<th class="r">Core &amp; Extras I leftover</th><th class="r">Top-ups</th><th class="r">Everyday Extras II spent</th><th>Big expenses spent</th><th class="r">Fund balance</th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table></div>')
 
 def budget_cards(L: Ledger, mo: str) -> str:
@@ -640,4 +644,89 @@ def budget_cards(L: Ledger, mo: str) -> str:
                f'<span class="hero num" style="font-family:var(--display);font-size:26px;font-weight:700;color:var(--{"good" if net >= 0 else "bad"})">'
                f'{m(abs(net))} {"ahead" if net >= 0 else "behind"}</span></div>')
     return f'<div class="lg-two">{reg_card}{x2_card}</div><p class="lg-note">The Regulars bar fills toward this month&#39;s Core + Extras I budget.</p>'
+
+
+def _mon(mo: str) -> str:
+    return month_label(mo).split()[0][:3] + " " + mo[2:4]
+
+
+def fund_chart(rows: list[dict], path: list[dict], when: dict) -> str:
+    """Bars for the fund balance: solid for months that happened, faded for the outlook."""
+    pts = [(r["month"], r["balance"], False) for r in rows] + [(p["month"], p["balance"], True) for p in path]
+    if not pts:
+        return ""
+    pts = pts[:36]
+    hi = max(0.0, max(v for _, v, _ in pts))
+    lo = min(0.0, min(v for _, v, _ in pts))
+    span = (hi - lo) or 1.0
+    W, H, top, bottom = 760, 230, 16, 40
+    ih = H - top - bottom
+    y0 = top + hi / span * ih
+    bw = W / len(pts)
+    bars, labels = [], []
+    marks = {v: k for k, v in when.items()}
+    step = max(1, len(pts) // 12)
+    for i, (mo, v, proj) in enumerate(pts):
+        x = i * bw + bw * .15
+        h = abs(v) / span * ih
+        y = y0 - h if v >= 0 else y0
+        col = "var(--good)" if v >= 0 else "var(--bad)"
+        bars.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw * .7:.1f}" height="{max(h, 1):.1f}" rx="2" fill="{col}" opacity="{.35 if proj else .9}">'
+                    f'<title>{e(month_label(mo))}: {m(v)}{" (outlook)" if proj else ""}</title></rect>')
+        if i % step == 0:
+            labels.append(f'<text x="{x + bw * .35:.1f}" y="{H - 22}" text-anchor="middle" font-size="10" fill="var(--muted)">{e(_mon(mo))}</text>')
+        if mo in marks:
+            labels.append(f'<text x="{x + bw * .35:.1f}" y="{H - 8}" text-anchor="middle" font-size="10" fill="var(--ink)">★</text>')
+    zero = f'<line x1="0" x2="{W}" y1="{y0:.1f}" y2="{y0:.1f}" stroke="var(--ink)" stroke-width="1" opacity=".5"/>'
+    return (f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" aria-label="Big-ticket fund balance by month" '
+            f'style="display:block;background:var(--surface);border:1px solid var(--line);border-radius:12px">{zero}{"".join(bars)}{"".join(labels)}</svg>')
+
+
+def fund_planner(L: Ledger, mo: str | None = None) -> str:
+    """Big-ticket planner: today's balance, how fast it refills, when it's back to $0, when each plan fits."""
+    F = L.fund()
+    rows = [r for r in F["rows"] if not mo or r["month"] <= mo] or F["rows"]
+    if not rows:
+        return '<p class="lg-note">The fund starts once there are statements from its first month.</p>'
+    bal = rows[-1]["balance"]
+    cur = rows[-1]["month"]
+    pm = F["per_month"]
+    btz = F["back_to_zero"]
+    col = "good" if bal >= 0 else "bad"
+    if bal >= 0:
+        btz_txt, btz_sub = "Now", "the fund isn&#39;t in deficit"
+    elif btz:
+        btz_txt, btz_sub = e(month_label(btz)), f'at about {m(pm)}/month, before any Regulars leftover'
+    else:
+        btz_txt, btz_sub = "Not at this pace", "everyday Extras II spending uses up the monthly amount"
+    head = ('<div class="lg-summary">'
+            f'<div><span class="lg-eyebrow">Big-ticket fund, end of {e(month_label(cur).split()[0])}</span>'
+            f'<span class="big num" style="color:var(--{col})">{m(bal)}</span>'
+            f'<span class="lg-muted" style="font-size:13px">{"saved up" if bal >= 0 else "spent ahead of future months"}</span></div>'
+            f'<div><span class="lg-eyebrow">Refills by</span><span class="big num">{m(pm)}<span style="font-size:16px;color:var(--muted)">/month</span></span>'
+            f'<span class="lg-muted" style="font-size:13px">{m(F["std"])} goes in · everyday Extras II has averaged {m(F["everyday"])} · '
+            'plus Regulars leftover in closed months</span></div>'
+            f'<div><span class="lg-eyebrow">Back to $0</span><span class="big">{btz_txt}</span>'
+            f'<span class="lg-muted" style="font-size:13px">{btz_sub}</span></div></div>')
+    faster = ""
+    if bal < 0 and pm > 0:
+        import math
+        alt = [(x, math.ceil(-bal / (pm + x))) for x in (250, 500, 1000)]
+        faster = ('<p class="lg-note">Each month you come in under on Regulars and close the month, the leftover goes in too: '
+                  + " · ".join(f'{m(x)}/month under → about {n} month{"s" if n != 1 else ""}' for x, n in alt)
+                  + f' (vs about {math.ceil(-bal / pm)} without).</p>')
+    plan_rows = "".join(
+        f'<tr><td><b>★ {e(k)}</b></td><td class="r num">{m(v)}</td><td>{e(month_label(F["affordable"][k])) if k in F["affordable"] else "<span class=lg-muted>later</span>"}</td></tr>'
+        for k, v in F["planned"].items())
+    plans = (f'<div class="lg-h2">Planned big-ticket items</div>'
+             '<p class="lg-note" style="margin:0 0 8px">What&#39;s still expected on each (estimate less spent so far), and the month the fund '
+             'could cover it if you wait for it to refill first, one after another. Edit estimates under Manage → Big expenses.</p>'
+             '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>Item</th><th class="r">Still to spend</th><th>Fund can cover it around</th></tr></thead>'
+             f'<tbody>{plan_rows}</tbody></table></div>') if plan_rows else ""
+    return (f'<div class="lg-h2" style="margin-top:4px">Big-ticket fund</div>'
+            '<p class="lg-note" style="margin:0 0 10px">Every month the same amount goes in. Actual Extras II and big-expense spending comes out. '
+            'After a big expense, wait until the fund is back above $0 before the next one.</p>'
+            + head + f'<div style="margin:14px 0 4px">{fund_chart(rows, F["path"], F["affordable"])}</div>'
+            '<p class="lg-note" style="margin-top:4px">Solid bars: what happened. Faded: the outlook at the current pace. ★ a planned item fits that month.</p>'
+            + faster + plans)
 

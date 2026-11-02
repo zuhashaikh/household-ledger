@@ -379,6 +379,8 @@ class Ledger:
         v = self.rules["exclude"].get(cat)
         if v is True or v is False:
             return v
+        if cat and (cat in self.plan["groups"] or cat in self.plan["budgets"]):
+            return False  # a budget line you named (e.g. "Loan Repayment") is spending, even if its name says "payment"
         return bool(DEFAULT_EXCLUDE.search(cat or ""))
 
     def resolve(self, t: dict) -> tuple[str | None, str]:
@@ -751,6 +753,10 @@ class Ledger:
         f.setdefault("start", "2026-09")
         f.setdefault("opening", 0.0)
         f.setdefault("closed", [])
+        if not f.get("monthly"):  # what goes in every month: the standard (not month-specific) Extras II budget
+            f["monthly"] = sum(float(v or 0) for c, v in self.plan["budgets"].items()
+                               if self.plan["groups"].get(c) == DEFAULT_SECTION and not self.is_excluded(c))
+            f["monthly_auto"] = True
         if "topups" not in f:  # from the budget sheet: Aneeq's Roth money for big expenses (no date yet = planned)
             f["topups"] = [{"month": "", "who": x.get("owner"), "amount": self.fund_amt(x), "note": f"{x.get('label', '')} for {p['name']}"}
                            for p in self.projects for x in p.get("funding") or [] if not x.get("line") and x.get("owner")]
@@ -761,10 +767,12 @@ class Ledger:
         return f"{y + (mo > 12)}-{(mo - 1) % 12 + 1:02d}"
 
     def fund_month(self, m: str) -> dict:
-        """One month of the Extras II fund."""
+        """One month of the Extras II (big-ticket) fund. Money in: the same fixed amount every month (one-off
+        allotments in the budget sheet don't count as money in), plus Core and Extras I leftover once the month is
+        closed, plus top-ups. Money out: actual Extras II and big-expense spending."""
         fs = self.fund_settings()
         plan = self.plan_for(m)
-        x2 = sum(float(v or 0) for c, v in plan.items() if self.plan["groups"].get(c) == DEFAULT_SECTION and not self.is_excluded(c))
+        x2 = float(fs["monthly"] or 0)
         res = self.compute(m) if m in self.months() else {"cats": []}
         cats = {r["cat"]: r for r in res["cats"]}
         lines = {c for c in plan if self.plan["groups"].get(c) in ("Home Budget", "Extras I")} | \
@@ -791,11 +799,10 @@ class Ledger:
             r["balance"] = bal
             rows.append(r)
             m = self._next(m)
-        # Projection: the standard monthly Extras II budget less the recent everyday Extras II spending,
-        # then the rest of every planned big expense and any undated top-ups.
-        std = sum(float(v or 0) for c, v in self.plan["budgets"].items() if self.plan["groups"].get(c) == DEFAULT_SECTION)
+        # Outlook: each month adds the fixed amount, less what everyday Extras II lines have been costing lately.
+        std = float(fs["monthly"] or 0)
         std_lines = {c for c in self.plan["budgets"] if self.plan["groups"].get(c) == DEFAULT_SECTION}
-        recent = [sum(x["all"] for x in self.compute(r["month"])["cats"] if x["cat"] in std_lines)
+        recent = [sum(x["all"] for x in self.compute(r["month"])["cats"] if self.plan["groups"].get(x["cat"]) == DEFAULT_SECTION)
                   for r in rows if r["month"] in self.months()][-3:]
         everyday = sum(recent) / len(recent) if recent else 0.0
         per_month = std - everyday
@@ -807,11 +814,31 @@ class Ledger:
         if low < 0 and per_month > 0:
             import math
             months_to_zero = math.ceil(-low / per_month)
+        # Month-by-month path: back to $0 first, then each planned big expense once the fund can cover it.
+        path, when, back_to_zero = [], {}, None
+        b, mo = bal, self._next(rows[-1]["month"]) if rows else fs["start"]
+        queue = list(planned.items())
+        if b >= 0:
+            back_to_zero = rows[-1]["month"] if rows else fs["start"]
+        for _ in range(60):
+            if per_month <= 0:
+                break
+            b += per_month
+            if back_to_zero is None and b >= 0:
+                back_to_zero = mo
+            while back_to_zero and queue and b >= queue[0][1]:
+                name, amt = queue.pop(0)
+                when[name] = mo
+                b -= amt
+            path.append({"month": mo, "balance": b})
+            mo = self._next(mo)
+            if back_to_zero and not queue and len(path) >= 6:
+                break
         return {"rows": rows, "balance": bal, "std": std, "everyday": everyday, "per_month": per_month,
                 "planned": planned, "undated_topups": undated, "low": low, "months_to_zero": months_to_zero,
+                "back_to_zero": back_to_zero, "affordable": when, "path": path,
                 "pending": [r for r in rows if not r["closed"] and r["month"] in self.months()]}
 
-    # ---------- importing ----------
     def add_parsed(self, rows: list[dict], statement_id: str, added_by: str, tolerance_days: int = 3) -> tuple[list[dict], int]:
         """Dedupe incoming rows (from a PDF statement or the bank feed) against what's stored.
         Same source: an exact match (bank-feed id, or same day/account/amount for statements).
