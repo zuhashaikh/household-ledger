@@ -22,8 +22,9 @@ html,body,[class*="css"],.stApp,.stMarkdown,button,input,select,textarea{font-fa
 .block-container{padding-top:2.2rem!important;max-width:1120px}
 h1,h2,h3{font-family:var(--display)!important;letter-spacing:-.01em;color:var(--ink)}
 [data-testid="stSidebar"]{background:var(--surface);border-right:1px solid var(--line)}
-.lg-eyebrow{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
-.lg-title{font-family:var(--display);font-size:30px;font-weight:700;color:var(--ink);margin:0 0 14px;line-height:1.15}
+.lg-eyebrow{font-size:13px;letter-spacing:0;color:var(--muted);font-weight:600}
+.lg-title{font-family:var(--display);font-size:26px;font-weight:700;color:var(--ink);margin:0 0 6px;line-height:1.15;letter-spacing:-.015em}
+.lg-month{font-family:var(--display);font-size:44px;font-weight:700;color:var(--ink);line-height:1;letter-spacing:-.025em;margin:18px 0 14px}
 .lg-h2{font-family:var(--display);font-size:19px;font-weight:700;color:var(--ink);margin:22px 0 8px}
 .lg-muted{color:var(--muted)}
 .lg-note{color:var(--muted);font-size:13px;margin:8px 0 0;max-width:72ch}
@@ -40,10 +41,14 @@ h1,h2,h3{font-family:var(--display)!important;letter-spacing:-.01em;color:var(--
 .lg-table{border-collapse:collapse;width:100%;font-size:14px;color:var(--ink);margin:0!important;border:0!important}
 .lg-table th,.lg-table td{border-left:0!important;border-right:0!important;border-top:0!important}
 .lg-scroll{margin-bottom:2px}
-.lg-table th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--surface)}
+.lg-table th{font-size:12.5px;letter-spacing:0;color:var(--muted);font-weight:600;text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--surface)}
 .lg-table td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
 .lg-table tr:last-child td{border-bottom:0}
 .lg-table .r{text-align:right}
+.lg-table td.num,.lg-table td.r{white-space:nowrap}
+details.how{margin:10px 0 0;max-width:72ch}
+details.how summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:14px}
+details.how p{margin:6px 0 0}
 .lg-table tr.grp td{background:var(--sunk);padding:7px 12px}
 .lg-table tr.sub td{font-size:13px;padding-top:5px;padding-bottom:5px;color:var(--muted)}
 .lg-table tr.sub td:first-child{padding-left:28px}
@@ -87,6 +92,22 @@ details.lc .ch .nm{min-width:0;overflow-wrap:anywhere}
 [data-testid="stDataFrame"],[data-testid="stDataEditor"]{border:1px solid var(--line);border-radius:12px;overflow:hidden}
 [data-testid="stExpander"] details{border-radius:12px;border-color:var(--line);background:var(--surface)}
 div[data-testid="stSegmentedControl"] button{font-weight:600}
+
+/* Top navigation: one pill track; the three pages and the Manage menu look the same */
+.st-key-nav{background:var(--sunk);padding:4px!important;border-radius:999px;width:fit-content!important;max-width:100%;gap:2px!important;flex-wrap:wrap}
+.st-key-nav .stButton>button,.st-key-nav .stButton>button[kind="primary"]{border:0!important;background:transparent!important;color:var(--muted)!important;
+  border-radius:999px!important;min-height:36px!important;height:36px;padding:0 18px!important;font-weight:600;font-size:14.5px;box-shadow:none!important}
+.st-key-nav .stButton>button:hover{color:var(--ink)!important;background:rgba(255,255,255,.55)!important}
+.st-key-nav .stButton>button[kind="primary"]{background:var(--surface)!important;color:var(--ink)!important;box-shadow:0 1px 2px rgba(28,35,32,.14)!important}
+.st-key-nav .stButton>button:focus-visible{outline:2px solid var(--accent)!important;outline-offset:1px}
+.st-key-nav [data-testid="stSelectbox"]{width:auto!important}
+.st-key-nav [data-testid="stSelectbox"] div{border-color:transparent!important;outline:none}
+.st-key-nav [data-baseweb="select"]>div,.st-key-nav [data-testid="stSelectbox"]>div>div{background:transparent!important;border:0!important;border-radius:999px!important;min-height:36px;
+  font-weight:600;font-size:14.5px;color:var(--muted);box-shadow:none!important;padding-left:8px;cursor:pointer}
+.st-key-nav [data-baseweb="select"]>div:hover,.st-key-nav [data-testid="stSelectbox"]>div>div:hover{background:rgba(255,255,255,.55)!important;color:var(--ink)}
+.st-key-nav input::placeholder,.st-key-nav [data-baseweb="select"] [class*="placeholder"]{color:var(--muted)!important;opacity:1}
+.st-key-nav.mg-on [data-baseweb="select"]>div{background:var(--surface)!important;color:var(--ink);box-shadow:0 1px 2px rgba(28,35,32,.14)!important}
+@media (max-width:640px){.st-key-nav{border-radius:14px}.lg-month{font-size:34px}}
 </style>
 """
 
@@ -101,9 +122,8 @@ def e(s) -> str:
 
 
 def header(person: str, title: str = "Zuha & Aneeq Ledger") -> str:
-    return (f'<div class="lg-eyebrow">Household spending · signed in as {e(PEOPLE.get(person, person))}</div>'
-            f'<div class="lg-title">{e(title)}</div>'
-            '<div class="lg-legend" style="margin:-6px 0 12px"><span><span class="dot d-zuha"></span>Zuha</span>'
+    return (f'<div class="lg-title">{e(title)}</div>'
+            '<div class="lg-legend" style="margin:0 0 4px"><span><span class="dot d-zuha"></span>Zuha</span>'
             '<span><span class="dot d-aneeq"></span>Aneeq</span><span><span class="dot d-shared"></span>Shared</span></div>')
 
 
@@ -367,12 +387,12 @@ def settle(L: Ledger, mo: str | None = None) -> str:
     body = "".join(body_rows)
     return ('<div class="lg-summary" style="grid-template-columns:1fr"><div><span class="lg-eyebrow">Settle-up</span>'
             f'<span class="big num" style="color:var(--{col})">{verdict}</span>{ahead_html}</div></div>'
-            '<p class="lg-note"><b>Due each month</b>: Aneeq&#39;s lines, his half of shared lines and his share of big expenses that Zuha paid, '
+            '<details class="how"><summary>How this is worked out</summary><p class="lg-note"><b>Due each month</b>: Aneeq&#39;s lines, his half of shared lines and his share of big expenses that Zuha paid, '
             'plus money Zuha sent him. If he paid for more of Zuha&#39;s share than she did of his, that extra is absorbed against Core and Extras I '
             'that month (Zuha never owes him). <b>Money he sends</b> pays, in order: anything owed from earlier months, Core, Extras I, '
             'his share of Extras II and big expenses, then money Zuha sent him. Anything beyond that goes to more of that month&#39;s Extras II '
             'and big expenses (he paid more than half of them, noted as a percentage), then, while the Extras II fund is in deficit, toward '
-            'Extras II Zuha paid in earlier months. Only what&#39;s left after that is credit toward his next month&#39;s dues.</p>'
+            'Extras II Zuha paid in earlier months. Only what&#39;s left after that is credit toward his next month&#39;s dues.</p></details>'
             '<div class="lg-scroll" style="margin-top:12px"><table class="lg-table"><thead><tr><th>Month</th><th class="r">Start of month</th>'
             '<th class="r">His share Zuha paid</th><th class="r">Zuha sent him</th><th class="r">His extra, absorbed</th><th class="r">Due this month</th>'
             '<th class="r">He sent</th><th class="r">Extras II he covered</th><th class="r">End of month</th></tr></thead>'

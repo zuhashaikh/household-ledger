@@ -211,6 +211,7 @@ def close_month_toggle(L: Ledger, m: str, key: str):
 
 def page_month(L: Ledger, m: str, person: str = "zuha"):
     """This month: totals, Regulars and Extras II at a glance, then every budget line with its charges."""
+    html(f'<div class="lg-month">{ui.e(month_label(m))}</div>')
     html(ui.summary(L, m))
     html(ui.budget_cards(L, m))
     close_month_toggle(L, m, f"close-ov-{m}")
@@ -1073,23 +1074,24 @@ def main():
     L = ledger_from(d)
     months = L.months()
 
-    top_l, top_r = st.columns([3, 1], vertical_alignment="bottom")
+    top_l, top_m, top_r = st.columns([5, 2, 2], vertical_alignment="center")
     top_l.markdown(ui.header(person, APP_TITLE), unsafe_allow_html=True)
-    m = top_r.selectbox("Month", list(reversed(months)), format_func=month_label, key="month") if months else None
+    m = top_m.selectbox("Month", list(reversed(months)), format_func=month_label, key="month", label_visibility="collapsed") if months else None
     top_r.button("＋ Upload statement", type="primary", width="stretch", key="go-upload", on_click=go, args=("Manage", "Bank sync"))
     if st.session_state.get("page") not in PAGES:
         st.session_state["page"] = "This month"
     if st.session_state.get("manage") not in MANAGE:
         st.session_state["manage"] = "Fix a charge"
     page = st.session_state["page"]
-    st.session_state["nav"] = page if page in MAIN else None
-    nav = st.container(horizontal=True, vertical_alignment="center", gap="small")
-    nav.segmented_control("Page", MAIN, key="nav", label_visibility="collapsed",
-                          on_change=lambda: go(st.session_state.get("nav") or st.session_state["page"]))
+    nav = st.container(horizontal=True, vertical_alignment="center", gap=None, key="nav")
+    for p in MAIN:
+        nav.button(p, key=f"nav-{p}", type="primary" if page == p else "secondary", on_click=go, args=(p,))
     st.session_state["mg-select"] = st.session_state["manage"] if page == "Manage" else None
-    nav.selectbox("Manage", MANAGE, key="mg-select", placeholder="Manage ▾", label_visibility="collapsed", width=210,
-                  format_func=lambda x: f"Manage: {x}",
+    nav.selectbox("Manage", MANAGE, key="mg-select", placeholder="Manage", label_visibility="collapsed", width=170,
                   on_change=lambda: go("Manage", st.session_state["mg-select"]) if st.session_state.get("mg-select") else None)
+    if page == "Manage":  # show the Manage menu as the selected tab
+        html('<style>.st-key-nav [data-baseweb="select"]>div,.st-key-nav [data-testid="stSelectbox"]>div>div{background:var(--surface)!important;color:var(--ink)!important;'
+             'box-shadow:0 1px 2px rgba(28,35,32,.14)!important}</style>')
 
     with st.sidebar:
         st.markdown(f"**{PEOPLE.get(person, person)}**  \n{email if email != 'local' else 'Local test mode'}")
