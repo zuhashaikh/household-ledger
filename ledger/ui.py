@@ -123,7 +123,7 @@ def e(s) -> str:
     return escape(str(s if s is not None else ""))
 
 
-def header(person: str, title: str = "Zuha & Aneeq Ledger") -> str:
+def header(person: str, title: str = "Gherbaar - Zuha & Aneeq") -> str:
     return (f'<div class="lg-title">{e(title)}</div>'
             '<div class="lg-legend" style="margin:0 0 4px"><span><span class="dot d-zuha"></span>Zuha</span>'
             '<span><span class="dot d-aneeq"></span>Aneeq</span><span><span class="dot d-shared"></span>Shared</span></div>')

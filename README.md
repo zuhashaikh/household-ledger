@@ -1,4 +1,4 @@
-# Zuha & Aneeq Ledger (Streamlit)
+# Gherbaar - Zuha & Aneeq (Streamlit)
 
 A private web app where Zuha and Aneeq each sign in with Google, upload PDF bank and card statements, and see the same up-to-date ledger:
 
