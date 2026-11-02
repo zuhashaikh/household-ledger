@@ -30,7 +30,7 @@ DEFAULT_PEOPLE = {"zuha": "zuha.m.shaikh@gmail.com", "aneeq": "aneeqc@gmail.com"
 
 PAGES = ["This month", "Big-ticket fund", "Settle up", "Manage"]
 MAIN = PAGES[:3]
-MANAGE = ["Fix a charge", "Budget lines", "Bank sync"]
+MANAGE = ["Budget lines", "Bank sync"]
 # The three colours used everywhere: purple = Zuha, blue = Aneeq, gold = Shared.
 WHO_NAME = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq", "shared": "🟡 Shared"}
 WHO_OPTS = [""] + list(WHO_NAME.values())
@@ -215,7 +215,56 @@ def page_month(L: Ledger, m: str, person: str = "zuha"):
     html(ui.summary(L, m))
     html(ui.budget_cards(L, m))
     close_month_toggle(L, m, f"close-ov-{m}")
-    html(ui.budget(L, m))
+    html(f'<div class="lg-h2">Budget lines</div><p class="lg-note" style="margin:0 0 8px">Open a line to see its charges and fix any on the spot: '
+         'change the Line or Who and press Save. 🟣 Zuha&#39;s line, 🔵 Aneeq&#39;s, 🟡 shared.</p>')
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+    for grp in ui.line_groups(L, m):
+        html(f'<div class="lg-group"><b>{ui.e(grp["label"])}</b><span class="lg-muted num">{ui.m(grp["spent"])} spent'
+             + (f' of {ui.m(grp["budget"])}' if grp["budget"] else "") + '</span></div>')
+        for ln in grp["lines"]:
+            with st.expander(ln["label"]):
+                html(ln["detail"])
+                raw_ids = []
+                for t in ln["charges"]:
+                    rid = t.get("split_of") or t.get("catchup_of") or t["id"]
+                    if not t.get("synthetic") and rid not in raw_ids:
+                        raw_ids.append(rid)
+                synth = [t for t in ln["charges"] if t.get("synthetic")]
+                if synth:
+                    html('<p class="lg-note" style="margin:4px 0">' + " · ".join(f'{ui.e(t["desc"])} {ui.m(t["spend"])}' for t in synth)
+                         + '. Change this under Budget lines → Rules → Taken from pay.</p>')
+                if raw_ids:
+                    byid = {t["id"]: t for t in L.txns}
+                    tx_editor(L, m, tx_records(L, [byid[i] for i in raw_ids if i in byid]),
+                              key=f"ln-{m}-{ln['cat']}", save_key=f"save-ln-{m}-{ln['cat']}", compact=True)
+                elif not synth:
+                    html('<p class="lg-note" style="margin:4px 0">No charges on this line this month.</p>')
+    html('<div class="lg-h2">Other charges</div><p class="lg-note" style="margin:0 0 8px">Charges that aren&#39;t on a budget line, '
+         'big expenses, money between you, and what isn&#39;t counted. Fix them here the same way.</p>')
+    recs = tx_records(L, L.month_txns(m, with_deductions=False, split=False))
+    buckets = [("Not on a budget line", lambda r: r["flags"]["nib"]),
+               ("Needs a person", lambda r: not (r["flags"]["who"] or r["flags"]["ex"] or r["flags"]["cb"] or r["flags"]["pj"]) and not r["flags"]["nib"]),
+               ("Big expenses", lambda r: r["flags"]["pj"] and not r["flags"]["cb"]),
+               ("Money between you", lambda r: r["flags"]["cb"] or bool(r["t"].get("not_between"))),
+               ("Not counted (card payments, transfers, 🚫)", lambda r: r["flags"]["ex"])]
+    for name, test in buckets:
+        rows = [r for r in recs if test(r)]
+        total = sum(r["t"]["spend"] for r in rows)
+        head = f"**{name}**  ·  {len(rows)} charge{'s' if len(rows) != 1 else ''}" + (f"  ·  {ui.m(total)}" if rows else "")
+        with st.expander(head.replace("$", "\\$")):
+            if rows:
+                tx_editor(L, m, rows, key=f"oth-{m}-{name}", save_key=f"save-oth-{m}-{name}", compact=name != "Money between you")
+            else:
+                html('<p class="lg-note" style="margin:4px 0">Nothing here this month.</p>')
+    with st.expander("**Search all charges this month**"):
+        q = st.text_input("Merchant, line or account", key=f"srch-{m}").lower().strip()
+        if q:
+            rows = [r for r in recs if q in f"{r['t']['desc']} {r['c']} {r['t'].get('account', '')}".lower()]
+            if rows:
+                tx_editor(L, m, rows, key=f"srch-ed-{m}-{q}", save_key=f"save-srch-{m}")
+            else:
+                html('<p class="lg-note">No charges match.</p>')
     with st.expander("Budget check by person"):
         names = {"zuha": "🟣 Zuha", "aneeq": "🔵 Aneeq"}
         who_label = st.segmented_control("Person", list(names.values()), default=names.get(person, names["zuha"]),
@@ -356,30 +405,18 @@ def page_budget(L: Ledger, m: str, person: str = "zuha"):
                 save_config("plan", plan)
                 save_config("rules", rules)
                 st.session_state["bud-flash"] = (f"Added “{name}” ({ui.m(amt)}/month, {sec}). Charges can be put on it from the "
-                                                 "Manage → Fix a charge.")
+                                                 "This month (open the line).")
                 st.rerun()
     if st.session_state.get("bud-flash"):
         st.success(st.session_state.pop("bud-flash"))
 
 
-def page_transactions(L: Ledger, m: str, person: str):
-    html(f'<div class="lg-h2" style="margin-top:4px">Transactions, {ui.e(month_label(m))}</div>')
-    show = st.radio("Show", ["All", "Not in budget", "Needs a person", "Big expenses", "Money between you", "Not counted"],
-                    horizontal=True, key="txfilter")
-    budget_set = set(L.budget_lines())
-    q = st.text_input("Search merchant, line or account", key="txsearch").lower()
+def tx_records(L: Ledger, txns: list[dict]) -> list[dict]:
+    """One editable row per charge (as stored), with what the app currently does with it."""
     proj_label = {p["id"]: "★ " + p["name"] for p in L.projects}
-    label_proj = {v: k for k, v in proj_label.items()}
-    lines = L.all_categories(m)
-    line_opts = [NO_LINE] + lines + list(proj_label.values()) + ["🚫 " + DONT_COUNT]
-    items = sorted({i["name"] for p in L.projects for i in p.get("items") or []})
-
-    recs, ids = [], []
-    deds = L.deduction_txns(m) if L.month_txns(m, with_deductions=False) else []
-    if deds:
-        html('<p class="lg-note" style="margin:0 0 8px">Also counted this month, without a statement: '
-             + " · ".join(f'{ui.e(t["desc"])} {ui.m(t["spend"])}' for t in deds) + '. Change these in Rules → Taken from pay.</p>')
-    for t in sorted(L.month_txns(m, with_deductions=False, split=False), key=lambda t: t["date"], reverse=True):
+    budget_set = set(L.budget_lines())
+    out = []
+    for t in sorted(txns, key=lambda t: t["date"], reverse=True):
         cb, pj, c = L.contrib_of(t), L.proj_of(t), L.cat_of(t)
         sp = L.split_parts(t)
         ex = L.is_excluded(c) and not cb and not pj
@@ -409,43 +446,72 @@ def page_transactions(L: Ledger, m: str, person: str):
             status = f"Refund of the {orig['date']} charge · counts in {month_label(L.month_of(orig))} · " + status
         elif L.shifted(t):
             status = f"Counts in {month_label(L.month_of(t))} (billed for next month) · " + status
-        keep = {"Needs a person": not (who or ex or cb or pj), "All": True, "Big expenses": bool(pj and not cb),
-                "Not in budget": not (ex or cb or pj or sp) and c not in budget_set,
-                "Money between you": bool(cb) or bool(t.get("not_between")), "Not counted": ex}[show]
-        if not keep or (q and q not in f"{t['desc']} {c} {t.get('account','')}".lower()):
-            continue
         line_val = proj_label.get(pj["id"]) if pj else ((t.get("for_line") or NO_LINE) if cb else (NO_LINE if sp else c))
         if t.get("cat_override") == DONT_COUNT:
             line_val, status = "🚫 " + DONT_COUNT, "Not counted (you chose this) · set a Line to count it again"
-        recs.append({"Date": t["date"], "Merchant": t["desc"], "Paid from": PAID_NAME.get(L.payer_of(t) or "", "⚪ not set"),
-                     "Amount": t["spend"], "Line": line_val,
-                     "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
-                     "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False,
-                     "Not between us": bool(t.get("not_between")), "Status": status})
-        ids.append(t["id"])
-    if not recs:
+        out.append({"id": t["id"], "t": t, "c": c, "flags": {"cb": bool(cb), "pj": bool(pj), "ex": ex, "sp": bool(sp), "who": who,
+                                                              "nib": not (ex or cb or pj or sp) and c not in budget_set},
+                    "rec": {"Date": t["date"], "Merchant": t["desc"], "Paid from": PAID_NAME.get(L.payer_of(t) or "", "⚪ not set"),
+                            "Amount": t["spend"], "Line": line_val,
+                            "Who": (WHO_NAME.get(who, UNSET) if who else UNSET) if not (pj or cb or ex) else NO_ITEM,
+                            "Item": t.get("proj_item") or NO_ITEM, "Only this charge": False,
+                            "Not between us": bool(t.get("not_between")), "Status": status}})
+    return out
+
+
+def page_transactions(L: Ledger, m: str, person: str):
+    html(f'<div class="lg-h2" style="margin-top:4px">Fix a charge, {ui.e(month_label(m))}</div>')
+    show = st.radio("Show", ["All", "Not in budget", "Needs a person", "Big expenses", "Money between you", "Not counted"],
+                    horizontal=True, key="txfilter")
+    q = st.text_input("Search merchant, line or account", key="txsearch").lower()
+    deds = L.deduction_txns(m) if L.month_txns(m, with_deductions=False) else []
+    if deds:
+        html('<p class="lg-note" style="margin:0 0 8px">Also counted this month, without a statement: '
+             + " · ".join(f'{ui.e(t["desc"])} {ui.m(t["spend"])}' for t in deds) + '. Change these in Rules → Taken from pay.</p>')
+    rows = []
+    for r in tx_records(L, L.month_txns(m, with_deductions=False, split=False)):
+        f, t = r["flags"], r["t"]
+        keep = {"Needs a person": not (f["who"] or f["ex"] or f["cb"] or f["pj"]), "All": True, "Big expenses": f["pj"] and not f["cb"],
+                "Not in budget": f["nib"], "Money between you": f["cb"] or bool(t.get("not_between")), "Not counted": f["ex"]}[show]
+        if keep and not (q and q not in f"{t['desc']} {r['c']} {t.get('account','')}".lower()):
+            rows.append(r)
+    if not rows:
         st.info("Nothing here.")
         return
     html('<p class="lg-note" style="margin:0 0 8px">Change a charge&#39;s <b>Line</b> or <b>Who</b> and press Save. '
          'Choose ★ in Line to put a charge under a big expense.</p>')
-    df = pd.DataFrame(recs)
-    edited = st.data_editor(
-        df, hide_index=True, width="stretch", key=f"tx-{m}-{show}-{q}",
-        column_config={
-            "Date": st.column_config.TextColumn(disabled=True, width="small"),
-            "Merchant": st.column_config.TextColumn(disabled=True, width="large"),
-            "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
-            "Amount": st.column_config.NumberColumn(format="dollar", disabled=True, width="small"),
-            "Line": st.column_config.SelectboxColumn(options=line_opts, help="Budget line, or ★ a big expense"),
-            "Who": st.column_config.SelectboxColumn(options=[UNSET] + WHO_OPTS[1:] + [NO_ITEM], help="Whose budget this counts toward"),
-            "Item": st.column_config.SelectboxColumn(options=[NO_ITEM] + items, help="Big-expense item"),
-            "Only this charge": st.column_config.CheckboxColumn(help="Tick to change just this charge. Otherwise the choice is remembered for the merchant from now on."),
-            "Not between us": st.column_config.CheckboxColumn(help="Tick if this was matched as money between you but isn't (e.g. a payment that just mentions Wells Fargo)."),
-            "Status": st.column_config.TextColumn(disabled=True)})
+    tx_editor(L, m, rows, key=f"tx-{m}-{show}-{q}", save_key="save-tx")
     html('<p class="lg-note" style="margin:6px 0">Changes are remembered for the merchant: this month, later months and future statements. '
          'Earlier months keep what they had. To forget a remembered choice, set Line to — or Who to ⚪ Not set. '
          'Tick <b>Only this charge</b> for a one-off exception.</p>')
-    if st.button("Save changes", type="primary", key="save-tx"):
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+
+
+def tx_editor(L: Ledger, m: str, rows: list[dict], key: str, save_key: str, compact: bool = False):
+    """The editable charges table and its Save button."""
+    proj_label = {p["id"]: "★ " + p["name"] for p in L.projects}
+    label_proj = {v: k for k, v in proj_label.items()}
+    line_opts = [NO_LINE] + L.all_categories(m) + list(proj_label.values()) + ["🚫 " + DONT_COUNT]
+    items = sorted({i["name"] for p in L.projects for i in p.get("items") or []})
+    ids = [r["id"] for r in rows]
+    df = pd.DataFrame([r["rec"] for r in rows])
+    cols = {
+        "Date": st.column_config.TextColumn(disabled=True, width="small"),
+        "Merchant": st.column_config.TextColumn(disabled=True, width="large"),
+        "Paid from": st.column_config.TextColumn(disabled=True, width="small"),
+        "Amount": st.column_config.NumberColumn(format="dollar", disabled=True, width="small"),
+        "Line": st.column_config.SelectboxColumn(options=line_opts, help="Budget line, ★ a big expense, or 🚫 Don't count"),
+        "Who": st.column_config.SelectboxColumn(options=[UNSET] + WHO_OPTS[1:] + [NO_ITEM], help="Whose budget this counts toward"),
+        "Item": st.column_config.SelectboxColumn(options=[NO_ITEM] + items, help="Big-expense item"),
+        "Only this charge": st.column_config.CheckboxColumn(help="Tick to change just this charge. Otherwise the choice is remembered for the merchant from now on."),
+        "Not between us": st.column_config.CheckboxColumn(help="Tick if this was matched as money between you but isn't (e.g. a payment that just mentions Wells Fargo)."),
+        "Status": st.column_config.TextColumn(disabled=True)}
+    order = list(df.columns)
+    if compact:
+        order = ["Date", "Merchant", "Paid from", "Amount", "Line", "Who", "Only this charge", "Status"]
+    edited = st.data_editor(df, hide_index=True, width="stretch", key=key, column_config=cols, column_order=order)
+    if st.button("Save changes", type="primary", key=save_key):
         changes: dict[str, dict] = {}
         learn: dict[str, dict] = {}
         byid = {t["id"]: t for t in L.txns}
@@ -510,8 +576,6 @@ def page_transactions(L: Ledger, m: str, person: str):
                                          "they apply to future statements too."
                                          if learn else f"Saved {len(changes)} change{'s' if len(changes) != 1 else ''} to just those charges.")
             st.rerun()
-    if st.session_state.get("flash"):
-        st.success(st.session_state.pop("flash"))
 
 
 def page_unbudgeted(L: Ledger, m: str | None):
@@ -637,7 +701,7 @@ def page_fund(L: Ledger, m: str | None = None):
 def page_projects(L: Ledger):
     """Manage → Big expenses: estimates, items, splits; add a new one."""
     html('<div class="lg-h2" style="margin-top:4px">Big expenses</div><p class="lg-note" style="margin:0 0 12px">Paid from the big-ticket fund and split 50:50 unless you change it. '
-         'Tag a charge to one under Manage → Fix a charge by choosing ★ in the Line column.</p>')
+         'Tag a charge to one on This month by choosing ★ in its Line column.</p>')
     for p in L.projects:
         stt = L.proj_stats(p)
         html(ui.big_card(L, p))
@@ -737,7 +801,7 @@ def run_sync(person: str) -> tuple[str, list[str]]:
             for t, r in zip(unknown, done):
                 t["category"] = r["category"]
         except Exception:  # noqa: BLE001 — leave them for the Not in budget tab
-            errs.append("Claude couldn't categorize some new charges; they're under Manage → Fix a charge (filter: Not in budget).")
+            errs.append("Claude couldn't categorize some new charges; they're on This month under Other charges → Not on a budget line.")
     # New accounts: Chase is Zuha's, Wells Fargo is Aneeq's.
     rules, changed = LL.rules, False
     for a in {t["account"] for t in new}:
@@ -927,8 +991,8 @@ def page_rules(L: Ledger, d: dict):
                          column_config={"From": st.column_config.SelectboxColumn(options=["Aneeq", "Zuha"])})
 
     lines = L.budget_lines()
-    st.markdown("**Remembered merchants** (set under Manage → Fix a charge; these win over every other rule). "
-                "Removing one here forgets it for every month; to stop it only from a month on, set its Line to — under Fix a charge.")
+    st.markdown("**Remembered merchants** (set on This month when you change a charge; these win over every other rule). "
+                "Removing one here forgets it for every month; to stop it only from a month on, set its Line to — on This month.")
     lrn = rules.get("learn") or {}
     lrdf = pd.DataFrame([{"Merchant": k, "Line": v.get("line", "") or ("★ " + pn) if (pn := {p["id"]: p["name"] for p in L.projects}.get(v.get("project"))) else v.get("line", ""),
                           "Who": WHO_NAME.get(v.get("who"), "")} for k, v in sorted(lrn.items())],
@@ -1081,7 +1145,7 @@ def main():
     if st.session_state.get("page") not in PAGES:
         st.session_state["page"] = "This month"
     if st.session_state.get("manage") not in MANAGE:
-        st.session_state["manage"] = "Fix a charge"
+        st.session_state["manage"] = "Budget lines"
     page = st.session_state["page"]
     nav = st.container(horizontal=True, vertical_alignment="center", gap=None, key="nav")
     for p in MAIN:
@@ -1110,10 +1174,8 @@ def main():
             page_statements(L, d, person)
         elif not m:
             st.info("Add a statement or sync your banks to get started.")
-        elif sub == "Budget lines":
-            page_budget(L, m, person)
         else:
-            page_transactions(L, m, person)
+            page_budget(L, m, person)
             with st.expander("Rules: accounts, store rules, merchant rules"):
                 page_rules(L, d)
     elif page == "Big-ticket fund":

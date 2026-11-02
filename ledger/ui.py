@@ -84,6 +84,8 @@ details.lc[open] summary::before{content:"▾"}
 details.lc .chs{margin-top:6px;border-top:1px solid var(--line);font-size:12.5px}
 details.lc .ch{display:grid;grid-template-columns:42px 1fr auto;gap:8px;padding:4px 0;border-bottom:1px dashed var(--line)}
 details.lc .ch .nm{min-width:0;overflow-wrap:anywhere}
+.lg-group{display:flex;gap:12px;align-items:baseline;margin:16px 0 6px;font-size:15px;color:var(--ink)}
+.lg-group .lg-muted{font-size:13px}
 .lg-legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--muted);margin:2px 0 8px}
 
 /* Streamlit widgets, nudged toward the same look */
@@ -365,7 +367,7 @@ def big_card(L: Ledger, p: dict) -> str:
           f' · paid on his own cards {m(ps["direct"])}.</p>') if abs(ps["share"]) >= 1 else ""
     charges = "".join(f'<tr><td class="num lg-muted" style="white-space:nowrap">{e(t["date"])}</td><td><b>{e(t["desc"])}</b><span class="why">{e(t.get("account",""))} · {e(PAYER_LABEL.get(L.payer_of(t) or "unset"))}{(" · " + e(t["proj_item"])) if t.get("proj_item") else ""}</span></td><td class="r num">{m(t["spend"], True)}</td></tr>' for t in s["txns"])
     charges_html = (f'<div class="lg-eyebrow" style="margin:14px 0 6px">Charges</div><div class="lg-scroll"><table class="lg-table"><tbody>{charges}</tbody></table></div>'
-                    if charges else f'<p class="lg-note">No charges yet. Under Manage → Fix a charge, choose “★ {e(p["name"])}” as a charge&#39;s line.</p>')
+                    if charges else f'<p class="lg-note">No charges yet. On This month, choose “★ {e(p["name"])}” as a charge&#39;s line.</p>')
     return (f'<div class="lg-card"><h3>{e(p["name"])}</h3>'
             f'<div class="lg-stats"><div><span class="lg-eyebrow">Estimated</span><div class="v num">{m(s["est"])}</div></div>'
             f'<div><span class="lg-eyebrow">Spent so far (in statements)</span><div class="v num">{m(s["spent"])}</div><span class="lg-muted" style="font-size:13px">{len(s["txns"])} transaction{"s" if len(s["txns"]) != 1 else ""}</span></div></div>'
@@ -466,7 +468,7 @@ def settle_breakdown(L: Ledger, rows: list, mo: str | None) -> str:
                       f'<td class="r num">{m(abs(t["spend"]), True)}</td></tr>' for t in sorted(tx, key=lambda t: t["date"]))
     tx_html = (f'<div class="lg-eyebrow" style="margin:14px 0 6px">Money counted between you in {e(month_label(r["month"]))}</div>'
                f'<div class="lg-scroll"><table class="lg-table"><tbody>{tx_rows}</tbody></table></div>'
-               '<p class="lg-note">If something here isn&#39;t really money between you, open it under Manage → Fix a charge (filter: Money between you) '
+               '<p class="lg-note">If something here isn&#39;t really money between you, open it on This month under Other charges → Money between you '
                'and tick <b>Not between us</b>.</p>') if tx_rows else ""
     return (f'<div class="lg-h2">Where Aneeq&#39;s money went, {e(month_label(r["month"]))}</div>'
             f'<p class="lg-note" style="margin:0 0 8px">{sent}. It pays, in order: anything owed from earlier months, Core, Extras I, '
@@ -512,7 +514,7 @@ def person_budget(L: Ledger, mo: str, who: str) -> str:
     note += ('<p class="lg-note">Core and Extras I only. Extras II is a shared fund: see the Extras II fund on the Overview and Big expenses tabs.</p>')
     if pb["unassigned"] >= 1:
         note += (f'<p class="lg-note">{m(pb["unassigned"])} of spending this month has no person yet and isn&#39;t counted for anyone. '
-                 'Assign it under Manage → Fix a charge.</p>')
+                 'Assign it on This month under Other charges.</p>')
     return (f'{head}{note}<div class="lg-scroll" style="margin-top:10px"><table class="lg-table"><thead><tr><th>Line</th><th class="r">{e(name)}&#39;s budget</th>'
             f'<th class="r">Spent</th><th></th><th>Status</th></tr></thead><tbody>{"".join(out)}</tbody></table></div>')
 
@@ -765,4 +767,67 @@ def fund_planner(L: Ledger, mo: str | None = None) -> str:
             + head + f'<div style="margin:14px 0 4px">{fund_chart(rows, F["path"], F["affordable"])}</div>'
             '<p class="lg-note" style="margin-top:4px">Solid bars: what happened. Faded: the outlook at the current pace. ★ a planned item fits that month.</p>'
             + faster + plans)
+
+
+def line_groups(L: Ledger, mo: str) -> list[dict]:
+    """Budget lines for the month grouped by section, each with what's needed to show it as an expandable row:
+    a short label (spent, budget, status), a detail block (whose line, which account paid) and its charges."""
+    rows = L.budget_rows(mo)
+    charges = line_charges(L, mo)
+    bank = {"zuha": "Chase", "aneeq": "Wells Fargo", "shared": "Shared", "unset": "Not set"}
+    dot = {"zuha": "🟣", "aneeq": "🔵", "shared": "🟡"}
+    groups: list[dict] = []
+    for r in rows:
+        g = r["section"]
+        if not groups or groups[-1]["key"] != g:
+            groups.append({"key": g, "label": dict(SECTIONS).get(g, g), "lines": [], "spent": 0.0, "budget": 0.0})
+        grp = groups[-1]
+        x2 = g == DEFAULT_SECTION
+        b = 0.0 if x2 else r["available"]
+        grp["spent"] += r["all"]
+        grp["budget"] += b
+        paid, owner = r["paid"], r["owner"]
+        if x2:
+            status = ""
+        elif not b:
+            status = ":red[no budget]" if abs(r["all"]) >= .5 else ""
+        elif r["all"] > b + .5:
+            status = f":red[{m(r['all'] - b)} over]"
+        elif r["all"] > b * .85:
+            status = f":orange[{m(b - r['all'])} left]"
+        else:
+            status = f":green[{m(b - r['all'])} left]"
+        ch = charges.get(r["cat"], [])
+        label = (f'{dot.get(owner, "⚪")} **{r["cat"]}**  ·  {m(r["all"])}' + (f' of {m(b)}' if b else "")
+                 + (f'  ·  {status}' if status else "") + (f'  ·  {len(ch)} charge{"s" if len(ch) != 1 else ""}' if ch else ""))
+        scale = max(b, r["all"], 1)
+        x, segs = 0.0, ""
+        for k in ("zuha", "aneeq", "shared", "unset"):
+            w = max(0.0, paid.get(k, 0)) / scale * 100
+            segs += f'<span class="s-{"none" if k == "unset" else k}" style="left:{x:.2f}%;width:{w:.2f}%"></span>'
+            x += w
+        if b and r["all"] > b:
+            segs += f'<span style="left:{b / scale * 100:.2f}%;width:2px;background:var(--ink)"></span>'
+        payers = " ".join(f'<span class="num" style="white-space:nowrap;margin-right:10px"><span class="dot d-{"none" if k == "unset" else k}"></span>{bank[k]} {m(paid[k])}</span>'
+                          for k in ("zuha", "aneeq", "shared", "unset") if abs(paid.get(k, 0)) >= .5)
+        notes = []
+        if owner in ("zuha", "aneeq"):
+            other = "aneeq" if owner == "zuha" else "zuha"
+            amt = paid.get(other, 0) + paid.get("shared", 0) / 2
+            if amt >= .5:
+                notes.append(f'<b style="color:var(--{other})">{PEOPLE[other]} paid {m(amt)}</b> of {PEOPLE[owner]}&#39;s line (Settle up trues it up)')
+        late: dict[str, float] = {}
+        for t in ch:
+            if t.get("catchup_of") and t.get("moved_from") and t["moved_from"] != mo:
+                late[t["moved_from"]] = late.get(t["moved_from"], 0.0) + t["spend"]
+        notes += [f'{m(v)} of it paid in {e(month_label(k).split()[0])}' for k, v in sorted(late.items()) if v >= .5]
+        whose = ("Shared 50:50" if owner == "shared" else PEOPLE[owner] + "&#39;s line") if owner else "No owner yet"
+        detail = (f'<div style="font-size:13px;color:var(--muted);margin:-4px 0 8px">{whose}'
+                  + (f' · budget {m(r["planned"])}' if r["planned"] and not x2 else "") + '</div>'
+                  + (f'<div class="bar {"over" if b and r["all"] > b else ""}" style="max-width:520px">{segs}</div>'
+                     f'<div style="margin:6px 0 2px;font-size:13px">{payers}</div>' if payers else "")
+                  + "".join(f'<div style="font-size:13px;color:var(--muted)">{n}</div>' for n in notes))
+        label = label.replace("$", "\\$")  # a bare $ would start math in the expander label
+        grp["lines"].append({"cat": r["cat"], "label": label, "detail": detail, "charges": ch})
+    return groups
 
