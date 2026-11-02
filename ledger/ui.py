@@ -136,14 +136,31 @@ def summary(L: Ledger, mo: str) -> str:
     for t in L.deduction_txns(mo) if L.month_txns(mo, with_deductions=False) else []:
         pay[t["payer"]] = pay.get(t["payer"], 0) + t["spend"]
 
+    st_ = res["settle"]
+    sent = {"zuha": st_["zuha_to_aneeq"], "aneeq": st_["aneeq_to_zuha"]}   # money each sent the other this month
+    joint = res["paid"].get("shared", 0.0) / 2
+    paid = {w: res["paid"][w] + joint for w in ("zuha", "aneeq")}
+    carried = {"zuha": paid["zuha"] - sent["aneeq"] + sent["zuha"], "aneeq": paid["aneeq"] - sent["zuha"] + sent["aneeq"]}
+    other = {"zuha": "aneeq", "aneeq": "zuha"}
+
     def cell(who, name, bank):
-        total = res["paid"][who]
-        sub = f'{bank} {m(total - pay[who])} · {m(pay[who])} taken from pay' if pay[who] else f'From {bank}'
-        return (f'<div><span class="lg-eyebrow"><span class="dot d-{who}"></span>Spent by {name}</span>'
-                f'<span class="big num">{m(total)}</span><span class="lg-muted num" style="font-size:13px">{sub}</span></div>')
+        bits = [f'Paid {m(paid[who])} from {bank}' + (f' and pay' if pay[who] else "")]
+        if sent[who] >= .5:
+            bits.append(f'+ {m(sent[who])} sent to {PEOPLE[other[who]]}')
+        if sent[other[who]] >= .5:
+            bits.append(f'− {m(sent[other[who]])} from {PEOPLE[other[who]]}')
+        return (f'<div><span class="lg-eyebrow"><span class="dot d-{who}"></span>{name} carried</span>'
+                f'<span class="big num">{m(carried[who])}</span><span class="lg-muted num" style="font-size:13px">{" ".join(bits)}</span></div>')
     hh = sum(res["paid"].values())
-    hh_cell = (f'<div><span class="lg-eyebrow">Household spent</span><span class="big num">{m(hh)}</span>'
-               f'<span class="lg-muted" style="font-size:13px">{e(month_label(mo).split()[0])} · both accounts, no transfers or card payments</span></div>')
+    tot = max(carried["zuha"], 0) + max(carried["aneeq"], 0)
+    zp = (max(carried["zuha"], 0) / tot) if tot else 0
+    weight = (f'<div class="bar" style="margin-top:6px"><span class="s-zuha" style="left:0;width:{zp * 100:.1f}%"></span>'
+              f'<span class="s-aneeq" style="left:{zp * 100:.1f}%;width:{(1 - zp) * 100:.1f}%"></span></div>'
+              f'<span class="lg-muted num" style="font-size:13px">Zuha {zp * 100:.0f}%, Aneeq {(1 - zp) * 100:.0f}% of the weight</span>') if tot else ""
+    unset = res["paid"].get("unset", 0.0)
+    hh_cell = (f'<div><span class="lg-eyebrow">Household spent in {e(month_label(mo).split()[0])}</span><span class="big num">{m(hh)}</span>'
+               + weight + (f'<span class="lg-muted" style="font-size:13px">{m(unset)} from an account with no owner set</span>' if abs(unset) >= .5 else "")
+               + '</div>')
     return ('<div class="lg-summary" style="grid-template-columns:repeat(4,minmax(0,1fr))">' + hh_cell + cell("zuha", "Zuha", "Chase") + cell("aneeq", "Aneeq", "Wells Fargo")
             + (f'<div><span class="lg-eyebrow">Aneeq owes Zuha</span><span class="big num" style="color:var(--zuha)">{m(owed if owed >= 1 else 0)}</span>'
                if owed > -1 else
