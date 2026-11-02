@@ -72,6 +72,13 @@ h1,h2,h3{font-family:var(--display)!important;letter-spacing:-.01em;color:var(--
 .lg-two .bar{height:14px}
 .lg-two .rowline{display:flex;justify-content:space-between;gap:10px;font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:6px}
 .lg-two .rowline b{color:var(--ink);font-weight:600}
+details.lc summary{cursor:pointer;list-style:none}
+details.lc summary::-webkit-details-marker{display:none}
+details.lc summary::before{content:"▸";display:inline-block;width:14px;color:var(--muted)}
+details.lc[open] summary::before{content:"▾"}
+details.lc .chs{margin-top:6px;border-top:1px solid var(--line);font-size:12.5px}
+details.lc .ch{display:grid;grid-template-columns:42px 1fr auto;gap:8px;padding:4px 0;border-bottom:1px dashed var(--line)}
+details.lc .ch .nm{min-width:0;overflow-wrap:anywhere}
 .lg-legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--muted);margin:2px 0 8px}
 
 /* Streamlit widgets, nudged toward the same look */
@@ -190,10 +197,52 @@ def sections(L: Ledger, mo: str) -> str:
             f'<tbody>{"".join(out)}</tbody></table></div><p class="lg-note">{note}</p>')
 
 
+def line_charges(L: Ledger, mo: str) -> dict[str, list[dict]]:
+    """The charges counted on each budget line in a month (as they count: split, spread over months, refunds netted)."""
+    out: dict[str, list[dict]] = {}
+    for t in L.month_txns(mo):
+        if L.contrib_of(t) or L.proj_of(t):
+            continue
+        c = L.cat_of(t)
+        if L.is_excluded(c):
+            continue
+        out.setdefault(c, []).append(t)
+    for v in out.values():
+        v.sort(key=lambda t: (t.get("paid_on") or t.get("date") or ""), reverse=True)
+    return out
+
+
+def _charge_list(L: Ledger, ts: list[dict], raw: dict[str, dict]) -> str:
+    bank = {"zuha": "Chase", "aneeq": "Wells Fargo", "shared": "Joint"}
+    items = []
+    for t in ts:
+        notes = []
+        src = raw.get(t.get("split_of") or t.get("catchup_of") or "")
+        if t.get("split_of") and src:
+            notes.append(f'part of {m(src["spend"], True)}')
+        if t.get("catchup_of") and t.get("paid_on") and str(t["paid_on"])[:7] != t.get("month"):
+            notes.append(f'paid {e(str(t["paid_on"]))}')
+        if t.get("synthetic"):
+            notes.append("taken from pay")
+        if t["spend"] < 0:
+            notes.append("refund")
+        pay = L.payer_of(t)
+        who = L.resolve(t)[0]
+        acct = bank.get(pay or "", "account not set") if not t.get("synthetic") else "pay"
+        items.append(f'<div class="ch"><span class="num lg-muted">{e(str(t.get("paid_on") or t.get("date") or "")[5:])}</span>'
+                     f'<span class="nm">{e(t.get("desc", ""))}<span class="lg-muted"> · <span class="dot d-{pay or "none"}"></span>{acct}'
+                     f'{" · counts toward " + PEOPLE[who] if who and who != L.rules["category"].get(L.cat_of(t)) else ""}'
+                     f'{" · " + ", ".join(notes) if notes else ""}</span></span>'
+                     f'<span class="num">{m(t["spend"], True)}</span></div>')
+    return "".join(items)
+
+
 def budget(L: Ledger, mo: str) -> str:
     """Line by line: what the household spent against each line's budget, and which account it was paid from.
     The line's owner is shown under its name; when the other person paid for it, that's called out."""
     rows = L.budget_rows(mo)
+    charges = line_charges(L, mo)
+    raw = {t["id"]: t for t in L.txns}
     out, last = [], None
     by_group: dict[str, list] = {}
     for r in rows:
@@ -238,7 +287,10 @@ def budget(L: Ledger, mo: str) -> str:
             st = '<span class="pill over">no budget</span>'
         else:
             st = _state(r["all"], b)
-        out.append(f'<tr><td><b>{e(r["cat"])}</b>{own}</td><td class="r num">{m(r["planned"]) if r["planned"] else "–"}</td>'
+        ch = charges.get(r["cat"], [])
+        name = (f'<details class="lc"><summary><b>{e(r["cat"])}</b> <span class="lg-muted" style="font-size:12px">· {len(ch)} charge{"s" if len(ch) != 1 else ""}</span>{own}</summary>'
+                f'<div class="chs">{_charge_list(L, ch, raw)}</div></details>' if ch else f'<b>{e(r["cat"])}</b>{own}')
+        out.append(f'<tr><td style="min-width:260px">{name}</td><td class="r num">{m(r["planned"]) if r["planned"] else "–"}</td>'
                    f'<td class="r num"><b>{m(r["all"])}</b></td>'
                    + (f'<td style="min-width:220px"><div class="bar {"over" if b and r["all"] > b else ""}">{segs}</div>'
                       f'<div style="margin-top:4px;font-size:13px">{payers}</div>{cross}</td>' if payers else '<td></td>')
@@ -247,7 +299,7 @@ def budget(L: Ledger, mo: str) -> str:
               '<span><span class="dot d-aneeq"></span>Aneeq (Wells Fargo)</span><span><span class="dot d-none"></span>Account not set</span></div>')
     return (f'<div class="lg-h2">Budget vs. spent by line, {e(month_label(mo))}</div>{legend}'
             '<p class="lg-note" style="margin:0 0 8px">Spent is what the household spent on the line. The bar shows which account paid. '
-            'Under each line: whose line it is, and when the other person paid for it (Settle up trues that up).</p>'
+            'Under each line: whose line it is, and when the other person paid for it (Settle up trues that up). Click a line to see its charges.</p>'
             '<div class="lg-scroll"><table class="lg-table"><thead><tr><th>Line</th><th class="r">Budget</th><th class="r">Spent</th>'
             '<th>Paid from</th><th>Status</th></tr></thead>'
             f'<tbody>{"".join(out) or "<tr><td colspan=5 class=lg-muted>No budget or spending this month.</td></tr>"}</tbody></table></div>')
